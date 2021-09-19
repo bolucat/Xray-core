@@ -1,0 +1,2393 @@
+From 8884e948fef2e6b117dc1a2da226abc01ad697e6 Mon Sep 17 00:00:00 2001
+From: AkinoKaede <autmaple@protonmail.com>
+Date: Thu, 18 Mar 2021 23:24:24 +0800
+Subject: [PATCH] refactor: new dns app
+
+---
+ app/dispatcher/default.go                     |   7 +-
+ app/dns/config.go                             |  63 +++
+ app/dns/config.pb.go                          | 160 ++++---
+ app/dns/config.proto                          |   4 +
+ app/dns/dns.go                                | 230 +++++++++
+ app/dns/{server_test.go => dns_test.go}       |   0
+ app/dns/hosts.go                              |  57 ++-
+ app/dns/hosts_test.go                         |   6 +-
+ app/dns/nameserver.go                         | 203 +++++++-
+ app/dns/{dohdns.go => nameserver_doh.go}      |  52 ++-
+ app/dns/nameserver_doh_test.go                |  60 +++
+ app/dns/nameserver_fakedns.go                 |   8 +-
+ app/dns/nameserver_local.go                   |  41 ++
+ ...erver_test.go => nameserver_local_test.go} |   8 +-
+ app/dns/nameserver_quic.go                    | 387 +++++++++++++++
+ app/dns/nameserver_quic_test.go               |  60 +++
+ app/dns/{udpns.go => nameserver_udp.go}       |  34 +-
+ app/dns/server.go                             | 439 ------------------
+ app/router/command/config.go                  |   6 +
+ app/router/router.go                          |  10 +-
+ common/session/session.go                     |   2 +-
+ features/routing/context.go                   |   3 +
+ features/routing/session/context.go           |   8 +
+ infra/conf/dns.go                             |  12 +-
+ 24 files changed, 1240 insertions(+), 620 deletions(-)
+ create mode 100644 app/dns/config.go
+ rename app/dns/{server_test.go => dns_test.go} (100%)
+ rename app/dns/{dohdns.go => nameserver_doh.go} (89%)
+ create mode 100644 app/dns/nameserver_doh_test.go
+ create mode 100644 app/dns/nameserver_local.go
+ rename app/dns/{nameserver_test.go => nameserver_local_test.go} (72%)
+ create mode 100644 app/dns/nameserver_quic.go
+ create mode 100644 app/dns/nameserver_quic_test.go
+ rename app/dns/{udpns.go => nameserver_udp.go} (89%)
+ delete mode 100644 app/dns/server.go
+
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+index 50ed613..1c0ba79 100644
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -309,15 +309,10 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool) (Sni
+ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
+ 	var handler outbound.Handler
+ 
+-	skipRoutePick := false
+-	if content := session.ContentFromContext(ctx); content != nil {
+-		skipRoutePick = content.SkipRoutePick
+-	}
+-
+ 	routingLink := routing_session.AsRoutingContext(ctx)
+ 	inTag := routingLink.GetInboundTag()
+ 	isPickRoute := false
+-	if d.router != nil && !skipRoutePick {
++	if d.router != nil {
+ 		if route, err := d.router.PickRoute(routingLink); err == nil {
+ 			outTag := route.GetOutboundTag()
+ 			isPickRoute = true
+diff --git a/app/dns/config.go b/app/dns/config.go
+new file mode 100644
+index 0000000..6236f7b
+--- /dev/null
++++ b/app/dns/config.go
+@@ -0,0 +1,63 @@
++package dns
++
++import (
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/strmatcher"
++	"github.com/xtls/xray-core/common/uuid"
++)
++
++var typeMap = map[DomainMatchingType]strmatcher.Type{
++	DomainMatchingType_Full:      strmatcher.Full,
++	DomainMatchingType_Subdomain: strmatcher.Domain,
++	DomainMatchingType_Keyword:   strmatcher.Substr,
++	DomainMatchingType_Regex:     strmatcher.Regex,
++}
++
++// References:
++// https://www.iana.org/assignments/special-use-domain-names/special-use-domain-names.xhtml
++// https://unix.stackexchange.com/questions/92441/whats-the-difference-between-local-home-and-lan
++var localTLDsAndDotlessDomains = []*NameServer_PriorityDomain{
++	{Type: DomainMatchingType_Regex, Domain: "^[^.]+$"}, // This will only match domains without any dot
++	{Type: DomainMatchingType_Subdomain, Domain: "local"},
++	{Type: DomainMatchingType_Subdomain, Domain: "localdomain"},
++	{Type: DomainMatchingType_Subdomain, Domain: "localhost"},
++	{Type: DomainMatchingType_Subdomain, Domain: "lan"},
++	{Type: DomainMatchingType_Subdomain, Domain: "home.arpa"},
++	{Type: DomainMatchingType_Subdomain, Domain: "example"},
++	{Type: DomainMatchingType_Subdomain, Domain: "invalid"},
++	{Type: DomainMatchingType_Subdomain, Domain: "test"},
++}
++
++var localTLDsAndDotlessDomainsRule = &NameServer_OriginalRule{
++	Rule: "geosite:private",
++	Size: uint32(len(localTLDsAndDotlessDomains)),
++}
++
++func toStrMatcher(t DomainMatchingType, domain string) (strmatcher.Matcher, error) {
++	strMType, f := typeMap[t]
++	if !f {
++		return nil, newError("unknown mapping type", t).AtWarning()
++	}
++	matcher, err := strMType.New(domain)
++	if err != nil {
++		return nil, newError("failed to create str matcher").Base(err)
++	}
++	return matcher, nil
++}
++
++func toNetIP(addrs []net.Address) ([]net.IP, error) {
++	ips := make([]net.IP, 0, len(addrs))
++	for _, addr := range addrs {
++		if addr.Family().IsIP() {
++			ips = append(ips, addr.IP())
++		} else {
++			return nil, newError("Failed to convert address", addr, "to Net IP.").AtWarning()
++		}
++	}
++	return ips, nil
++}
++
++func generateRandomTag() string {
++	id := uuid.New()
++	return "xray.system." + id.String()
++}
+diff --git a/app/dns/config.pb.go b/app/dns/config.pb.go
+index 5a3368a..ae6b3a6 100644
+--- a/app/dns/config.pb.go
++++ b/app/dns/config.pb.go
+@@ -1,7 +1,7 @@
+ // Code generated by protoc-gen-go. DO NOT EDIT.
+ // versions:
+ // 	protoc-gen-go v1.25.0
+-// 	protoc        v3.14.0
++// 	protoc        v3.15.6
+ // source: app/dns/config.proto
+ 
+ package dns
+@@ -85,6 +85,7 @@ type NameServer struct {
+ 	unknownFields protoimpl.UnknownFields
+ 
+ 	Address           *net.Endpoint                `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
++	ClientIp          []byte                       `protobuf:"bytes,5,opt,name=client_ip,json=clientIp,proto3" json:"client_ip,omitempty"`
+ 	PrioritizedDomain []*NameServer_PriorityDomain `protobuf:"bytes,2,rep,name=prioritized_domain,json=prioritizedDomain,proto3" json:"prioritized_domain,omitempty"`
+ 	Geoip             []*router.GeoIP              `protobuf:"bytes,3,rep,name=geoip,proto3" json:"geoip,omitempty"`
+ 	OriginalRules     []*NameServer_OriginalRule   `protobuf:"bytes,4,rep,name=original_rules,json=originalRules,proto3" json:"original_rules,omitempty"`
+@@ -129,6 +130,13 @@ func (x *NameServer) GetAddress() *net.Endpoint {
+ 	return nil
+ }
+ 
++func (x *NameServer) GetClientIp() []byte {
++	if x != nil {
++		return x.ClientIp
++	}
++	return nil
++}
++
+ func (x *NameServer) GetPrioritizedDomain() []*NameServer_PriorityDomain {
+ 	if x != nil {
+ 		return x.PrioritizedDomain
+@@ -174,6 +182,8 @@ type Config struct {
+ 	StaticHosts []*Config_HostMapping `protobuf:"bytes,4,rep,name=static_hosts,json=staticHosts,proto3" json:"static_hosts,omitempty"`
+ 	// Tag is the inbound tag of DNS client.
+ 	Tag string `protobuf:"bytes,6,opt,name=tag,proto3" json:"tag,omitempty"`
++	// DisableCache Disable DNS cache
++	DisableCache bool `protobuf:"varint,8,opt,name=disableCache,proto3" json:"disableCache,omitempty"`
+ }
+ 
+ func (x *Config) Reset() {
+@@ -252,6 +262,13 @@ func (x *Config) GetTag() string {
+ 	return ""
+ }
+ 
++func (x *Config) GetDisableCache() bool {
++	if x != nil {
++		return x.DisableCache
++	}
++	return false
++}
++
+ type NameServer_PriorityDomain struct {
+ 	state         protoimpl.MessageState
+ 	sizeCache     protoimpl.SizeCache
+@@ -446,77 +463,82 @@ var file_app_dns_config_proto_rawDesc = []byte{
+ 	0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2f, 0x6e, 0x65, 0x74, 0x2f, 0x64, 0x65, 0x73, 0x74, 0x69,
+ 	0x6e, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x1a, 0x17, 0x61, 0x70,
+ 	0x70, 0x2f, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e,
+-	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x22, 0xad, 0x03, 0x0a, 0x0a, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65,
++	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x22, 0xca, 0x03, 0x0a, 0x0a, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65,
+ 	0x72, 0x76, 0x65, 0x72, 0x12, 0x33, 0x0a, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x18,
+ 	0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x19, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d,
+ 	0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x45, 0x6e, 0x64, 0x70, 0x6f, 0x69, 0x6e, 0x74,
+-	0x52, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x12, 0x56, 0x0a, 0x12, 0x70, 0x72, 0x69,
+-	0x6f, 0x72, 0x69, 0x74, 0x69, 0x7a, 0x65, 0x64, 0x5f, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x18,
+-	0x02, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70,
+-	0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x2e,
+-	0x50, 0x72, 0x69, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x52, 0x11,
+-	0x70, 0x72, 0x69, 0x6f, 0x72, 0x69, 0x74, 0x69, 0x7a, 0x65, 0x64, 0x44, 0x6f, 0x6d, 0x61, 0x69,
+-	0x6e, 0x12, 0x2c, 0x0a, 0x05, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b,
+-	0x32, 0x16, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
+-	0x65, 0x72, 0x2e, 0x47, 0x65, 0x6f, 0x49, 0x50, 0x52, 0x05, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x12,
+-	0x4c, 0x0a, 0x0e, 0x6f, 0x72, 0x69, 0x67, 0x69, 0x6e, 0x61, 0x6c, 0x5f, 0x72, 0x75, 0x6c, 0x65,
+-	0x73, 0x18, 0x04, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x25, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61,
+-	0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65,
+-	0x72, 0x2e, 0x4f, 0x72, 0x69, 0x67, 0x69, 0x6e, 0x61, 0x6c, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x0d,
+-	0x6f, 0x72, 0x69, 0x67, 0x69, 0x6e, 0x61, 0x6c, 0x52, 0x75, 0x6c, 0x65, 0x73, 0x1a, 0x5e, 0x0a,
+-	0x0e, 0x50, 0x72, 0x69, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x12,
+-	0x34, 0x0a, 0x04, 0x74, 0x79, 0x70, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x20, 0x2e,
+-	0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x44, 0x6f, 0x6d,
+-	0x61, 0x69, 0x6e, 0x4d, 0x61, 0x74, 0x63, 0x68, 0x69, 0x6e, 0x67, 0x54, 0x79, 0x70, 0x65, 0x52,
+-	0x04, 0x74, 0x79, 0x70, 0x65, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x18,
+-	0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x1a, 0x36, 0x0a,
+-	0x0c, 0x4f, 0x72, 0x69, 0x67, 0x69, 0x6e, 0x61, 0x6c, 0x52, 0x75, 0x6c, 0x65, 0x12, 0x12, 0x0a,
+-	0x04, 0x72, 0x75, 0x6c, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x72, 0x75, 0x6c,
+-	0x65, 0x12, 0x12, 0x0a, 0x04, 0x73, 0x69, 0x7a, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0d, 0x52,
+-	0x04, 0x73, 0x69, 0x7a, 0x65, 0x22, 0x9f, 0x04, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67,
+-	0x12, 0x3f, 0x0a, 0x0b, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x73, 0x18,
+-	0x01, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x19, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d,
+-	0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x45, 0x6e, 0x64, 0x70, 0x6f, 0x69, 0x6e, 0x74,
+-	0x42, 0x02, 0x18, 0x01, 0x52, 0x0b, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72,
+-	0x73, 0x12, 0x39, 0x0a, 0x0b, 0x6e, 0x61, 0x6d, 0x65, 0x5f, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72,
+-	0x18, 0x05, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x18, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70,
+-	0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72,
+-	0x52, 0x0a, 0x6e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x12, 0x39, 0x0a, 0x05,
+-	0x48, 0x6f, 0x73, 0x74, 0x73, 0x18, 0x02, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1f, 0x2e, 0x78, 0x72,
+-	0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x43, 0x6f, 0x6e, 0x66, 0x69,
+-	0x67, 0x2e, 0x48, 0x6f, 0x73, 0x74, 0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x42, 0x02, 0x18, 0x01,
+-	0x52, 0x05, 0x48, 0x6f, 0x73, 0x74, 0x73, 0x12, 0x1b, 0x0a, 0x09, 0x63, 0x6c, 0x69, 0x65, 0x6e,
+-	0x74, 0x5f, 0x69, 0x70, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x08, 0x63, 0x6c, 0x69, 0x65,
+-	0x6e, 0x74, 0x49, 0x70, 0x12, 0x43, 0x0a, 0x0c, 0x73, 0x74, 0x61, 0x74, 0x69, 0x63, 0x5f, 0x68,
+-	0x6f, 0x73, 0x74, 0x73, 0x18, 0x04, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x20, 0x2e, 0x78, 0x72, 0x61,
+-	0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67,
+-	0x2e, 0x48, 0x6f, 0x73, 0x74, 0x4d, 0x61, 0x70, 0x70, 0x69, 0x6e, 0x67, 0x52, 0x0b, 0x73, 0x74,
+-	0x61, 0x74, 0x69, 0x63, 0x48, 0x6f, 0x73, 0x74, 0x73, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67,
+-	0x18, 0x06, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x74, 0x61, 0x67, 0x1a, 0x55, 0x0a, 0x0a, 0x48,
+-	0x6f, 0x73, 0x74, 0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79,
+-	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x31, 0x0a, 0x05, 0x76,
+-	0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1b, 0x2e, 0x78, 0x72, 0x61,
+-	0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x49, 0x50, 0x4f,
+-	0x72, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02,
+-	0x38, 0x01, 0x1a, 0x92, 0x01, 0x0a, 0x0b, 0x48, 0x6f, 0x73, 0x74, 0x4d, 0x61, 0x70, 0x70, 0x69,
+-	0x6e, 0x67, 0x12, 0x34, 0x0a, 0x04, 0x74, 0x79, 0x70, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0e,
+-	0x32, 0x20, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e,
+-	0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x4d, 0x61, 0x74, 0x63, 0x68, 0x69, 0x6e, 0x67, 0x54, 0x79,
+-	0x70, 0x65, 0x52, 0x04, 0x74, 0x79, 0x70, 0x65, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x6f, 0x6d, 0x61,
+-	0x69, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e,
+-	0x12, 0x0e, 0x0a, 0x02, 0x69, 0x70, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0c, 0x52, 0x02, 0x69, 0x70,
+-	0x12, 0x25, 0x0a, 0x0e, 0x70, 0x72, 0x6f, 0x78, 0x69, 0x65, 0x64, 0x5f, 0x64, 0x6f, 0x6d, 0x61,
+-	0x69, 0x6e, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0d, 0x70, 0x72, 0x6f, 0x78, 0x69, 0x65,
+-	0x64, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x2a, 0x45, 0x0a, 0x12, 0x44, 0x6f, 0x6d, 0x61, 0x69,
+-	0x6e, 0x4d, 0x61, 0x74, 0x63, 0x68, 0x69, 0x6e, 0x67, 0x54, 0x79, 0x70, 0x65, 0x12, 0x08, 0x0a,
+-	0x04, 0x46, 0x75, 0x6c, 0x6c, 0x10, 0x00, 0x12, 0x0d, 0x0a, 0x09, 0x53, 0x75, 0x62, 0x64, 0x6f,
+-	0x6d, 0x61, 0x69, 0x6e, 0x10, 0x01, 0x12, 0x0b, 0x0a, 0x07, 0x4b, 0x65, 0x79, 0x77, 0x6f, 0x72,
+-	0x64, 0x10, 0x02, 0x12, 0x09, 0x0a, 0x05, 0x52, 0x65, 0x67, 0x65, 0x78, 0x10, 0x03, 0x42, 0x46,
+-	0x0a, 0x10, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64,
+-	0x6e, 0x73, 0x50, 0x01, 0x5a, 0x21, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d,
+-	0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f,
+-	0x61, 0x70, 0x70, 0x2f, 0x64, 0x6e, 0x73, 0xaa, 0x02, 0x0c, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x41,
+-	0x70, 0x70, 0x2e, 0x44, 0x6e, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x52, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x12, 0x1b, 0x0a, 0x09, 0x63, 0x6c, 0x69,
++	0x65, 0x6e, 0x74, 0x5f, 0x69, 0x70, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x08, 0x63, 0x6c,
++	0x69, 0x65, 0x6e, 0x74, 0x49, 0x70, 0x12, 0x56, 0x0a, 0x12, 0x70, 0x72, 0x69, 0x6f, 0x72, 0x69,
++	0x74, 0x69, 0x7a, 0x65, 0x64, 0x5f, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x18, 0x02, 0x20, 0x03,
++	0x28, 0x0b, 0x32, 0x27, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e,
++	0x73, 0x2e, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x2e, 0x50, 0x72, 0x69,
++	0x6f, 0x72, 0x69, 0x74, 0x79, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x52, 0x11, 0x70, 0x72, 0x69,
++	0x6f, 0x72, 0x69, 0x74, 0x69, 0x7a, 0x65, 0x64, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x12, 0x2c,
++	0x0a, 0x05, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x16, 0x2e,
++	0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e,
++	0x47, 0x65, 0x6f, 0x49, 0x50, 0x52, 0x05, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x12, 0x4c, 0x0a, 0x0e,
++	0x6f, 0x72, 0x69, 0x67, 0x69, 0x6e, 0x61, 0x6c, 0x5f, 0x72, 0x75, 0x6c, 0x65, 0x73, 0x18, 0x04,
++	0x20, 0x03, 0x28, 0x0b, 0x32, 0x25, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e,
++	0x64, 0x6e, 0x73, 0x2e, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x2e, 0x4f,
++	0x72, 0x69, 0x67, 0x69, 0x6e, 0x61, 0x6c, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x0d, 0x6f, 0x72, 0x69,
++	0x67, 0x69, 0x6e, 0x61, 0x6c, 0x52, 0x75, 0x6c, 0x65, 0x73, 0x1a, 0x5e, 0x0a, 0x0e, 0x50, 0x72,
++	0x69, 0x6f, 0x72, 0x69, 0x74, 0x79, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x12, 0x34, 0x0a, 0x04,
++	0x74, 0x79, 0x70, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x20, 0x2e, 0x78, 0x72, 0x61,
++	0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e,
++	0x4d, 0x61, 0x74, 0x63, 0x68, 0x69, 0x6e, 0x67, 0x54, 0x79, 0x70, 0x65, 0x52, 0x04, 0x74, 0x79,
++	0x70, 0x65, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x18, 0x02, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x1a, 0x36, 0x0a, 0x0c, 0x4f, 0x72,
++	0x69, 0x67, 0x69, 0x6e, 0x61, 0x6c, 0x52, 0x75, 0x6c, 0x65, 0x12, 0x12, 0x0a, 0x04, 0x72, 0x75,
++	0x6c, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x72, 0x75, 0x6c, 0x65, 0x12, 0x12,
++	0x0a, 0x04, 0x73, 0x69, 0x7a, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x04, 0x73, 0x69,
++	0x7a, 0x65, 0x22, 0xc9, 0x04, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x12, 0x3f, 0x0a,
++	0x0b, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x73, 0x18, 0x01, 0x20, 0x03,
++	0x28, 0x0b, 0x32, 0x19, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e,
++	0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x45, 0x6e, 0x64, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x42, 0x02, 0x18,
++	0x01, 0x52, 0x0b, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x73, 0x12, 0x39,
++	0x0a, 0x0b, 0x6e, 0x61, 0x6d, 0x65, 0x5f, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x18, 0x05, 0x20,
++	0x03, 0x28, 0x0b, 0x32, 0x18, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64,
++	0x6e, 0x73, 0x2e, 0x4e, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x52, 0x0a, 0x6e,
++	0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x12, 0x39, 0x0a, 0x05, 0x48, 0x6f, 0x73,
++	0x74, 0x73, 0x18, 0x02, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1f, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e,
++	0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e, 0x48,
++	0x6f, 0x73, 0x74, 0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x42, 0x02, 0x18, 0x01, 0x52, 0x05, 0x48,
++	0x6f, 0x73, 0x74, 0x73, 0x12, 0x1b, 0x0a, 0x09, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x5f, 0x69,
++	0x70, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x08, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x49,
++	0x70, 0x12, 0x43, 0x0a, 0x0c, 0x73, 0x74, 0x61, 0x74, 0x69, 0x63, 0x5f, 0x68, 0x6f, 0x73, 0x74,
++	0x73, 0x18, 0x04, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x20, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61,
++	0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x2e, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e, 0x48, 0x6f,
++	0x73, 0x74, 0x4d, 0x61, 0x70, 0x70, 0x69, 0x6e, 0x67, 0x52, 0x0b, 0x73, 0x74, 0x61, 0x74, 0x69,
++	0x63, 0x48, 0x6f, 0x73, 0x74, 0x73, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x06, 0x20,
++	0x01, 0x28, 0x09, 0x52, 0x03, 0x74, 0x61, 0x67, 0x12, 0x22, 0x0a, 0x0c, 0x64, 0x69, 0x73, 0x61,
++	0x62, 0x6c, 0x65, 0x43, 0x61, 0x63, 0x68, 0x65, 0x18, 0x08, 0x20, 0x01, 0x28, 0x08, 0x52, 0x0c,
++	0x64, 0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x43, 0x61, 0x63, 0x68, 0x65, 0x1a, 0x55, 0x0a, 0x0a,
++	0x48, 0x6f, 0x73, 0x74, 0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65,
++	0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x31, 0x0a, 0x05,
++	0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1b, 0x2e, 0x78, 0x72,
++	0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x49, 0x50,
++	0x4f, 0x72, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a,
++	0x02, 0x38, 0x01, 0x1a, 0x92, 0x01, 0x0a, 0x0b, 0x48, 0x6f, 0x73, 0x74, 0x4d, 0x61, 0x70, 0x70,
++	0x69, 0x6e, 0x67, 0x12, 0x34, 0x0a, 0x04, 0x74, 0x79, 0x70, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x0e, 0x32, 0x20, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73,
++	0x2e, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x4d, 0x61, 0x74, 0x63, 0x68, 0x69, 0x6e, 0x67, 0x54,
++	0x79, 0x70, 0x65, 0x52, 0x04, 0x74, 0x79, 0x70, 0x65, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x6f, 0x6d,
++	0x61, 0x69, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69,
++	0x6e, 0x12, 0x0e, 0x0a, 0x02, 0x69, 0x70, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0c, 0x52, 0x02, 0x69,
++	0x70, 0x12, 0x25, 0x0a, 0x0e, 0x70, 0x72, 0x6f, 0x78, 0x69, 0x65, 0x64, 0x5f, 0x64, 0x6f, 0x6d,
++	0x61, 0x69, 0x6e, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0d, 0x70, 0x72, 0x6f, 0x78, 0x69,
++	0x65, 0x64, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x4a, 0x04, 0x08, 0x07, 0x10, 0x08, 0x2a, 0x45,
++	0x0a, 0x12, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x4d, 0x61, 0x74, 0x63, 0x68, 0x69, 0x6e, 0x67,
++	0x54, 0x79, 0x70, 0x65, 0x12, 0x08, 0x0a, 0x04, 0x46, 0x75, 0x6c, 0x6c, 0x10, 0x00, 0x12, 0x0d,
++	0x0a, 0x09, 0x53, 0x75, 0x62, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x10, 0x01, 0x12, 0x0b, 0x0a,
++	0x07, 0x4b, 0x65, 0x79, 0x77, 0x6f, 0x72, 0x64, 0x10, 0x02, 0x12, 0x09, 0x0a, 0x05, 0x52, 0x65,
++	0x67, 0x65, 0x78, 0x10, 0x03, 0x42, 0x46, 0x0a, 0x10, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61,
++	0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x64, 0x6e, 0x73, 0x50, 0x01, 0x5a, 0x21, 0x67, 0x69, 0x74,
++	0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61,
++	0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x61, 0x70, 0x70, 0x2f, 0x64, 0x6e, 0x73, 0xaa, 0x02,
++	0x0c, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x41, 0x70, 0x70, 0x2e, 0x44, 0x6e, 0x73, 0x62, 0x06, 0x70,
++	0x72, 0x6f, 0x74, 0x6f, 0x33,
+ }
+ 
+ var (
+diff --git a/app/dns/config.proto b/app/dns/config.proto
+index 9448871..3004d8d 100644
+--- a/app/dns/config.proto
++++ b/app/dns/config.proto
+@@ -12,6 +12,7 @@ import "app/router/config.proto";
+ 
+ message NameServer {
+   xray.common.net.Endpoint address = 1;
++  bytes client_ip = 5;
+ 
+   message PriorityDomain {
+     DomainMatchingType type = 1;
+@@ -70,4 +71,7 @@ message Config {
+   string tag = 6;
+ 
+   reserved 7;
++
++  // DisableCache Disable DNS cache
++   bool disableCache = 8;
+ }
+diff --git a/app/dns/dns.go b/app/dns/dns.go
+index e56671e..5d9cc0e 100644
+--- a/app/dns/dns.go
++++ b/app/dns/dns.go
+@@ -2,3 +2,233 @@
+ package dns
+ 
+ //go:generate go run github.com/xtls/xray-core/common/errors/errorgen
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++
++	"github.com/xtls/xray-core/app/router"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/common/strmatcher"
++	"github.com/xtls/xray-core/features"
++	"github.com/xtls/xray-core/features/dns"
++)
++
++// DNS is a DNS rely server.
++type DNS struct {
++	sync.Mutex
++	tag           string
++	disableCache  bool
++	hosts         *StaticHosts
++	clients       []*Client
++	ctx           context.Context
++	domainMatcher strmatcher.IndexMatcher
++	matcherInfos  []DomainMatcherInfo
++}
++
++// DomainMatcherInfo contains information attached to index returned by Server.domainMatcher
++type DomainMatcherInfo struct {
++	clientIdx     uint16
++	domainRuleIdx uint16
++}
++
++// New creates a new DNS server with given configuration.
++func New(ctx context.Context, config *Config) (*DNS, error) {
++	var tag string
++	if len(config.Tag) > 0 {
++		tag = config.Tag
++	} else {
++		tag = generateRandomTag()
++	}
++
++	var clientIP net.IP
++	switch len(config.ClientIp) {
++	case 0, net.IPv4len, net.IPv6len:
++		clientIP = net.IP(config.ClientIp)
++	default:
++		return nil, newError("unexpected client IP length ", len(config.ClientIp))
++	}
++
++	hosts, err := NewStaticHosts(config.StaticHosts, config.Hosts)
++	if err != nil {
++		return nil, newError("failed to create hosts").Base(err)
++	}
++
++	clients := []*Client{}
++	domainRuleCount := 0
++	for _, ns := range config.NameServer {
++		domainRuleCount += len(ns.PrioritizedDomain)
++	}
++
++	// MatcherInfos is ensured to cover the maximum index domainMatcher could return, where matcher's index starts from 1
++	matcherInfos := make([]DomainMatcherInfo, domainRuleCount+1)
++	domainMatcher := &strmatcher.MatcherGroup{}
++	geoipContainer := router.GeoIPMatcherContainer{}
++
++	for _, endpoint := range config.NameServers {
++		features.PrintDeprecatedFeatureWarning("simple DNS server")
++		client, err := NewSimpleClient(ctx, endpoint, clientIP)
++		if err != nil {
++			return nil, newError("failed to create client").Base(err)
++		}
++		clients = append(clients, client)
++	}
++
++	for _, ns := range config.NameServer {
++		clientIdx := len(clients)
++		updateDomain := func(domainRule strmatcher.Matcher, originalRuleIdx int, matcherInfos []DomainMatcherInfo) error {
++			midx := domainMatcher.Add(domainRule)
++			matcherInfos[midx] = DomainMatcherInfo{
++				clientIdx:     uint16(clientIdx),
++				domainRuleIdx: uint16(originalRuleIdx),
++			}
++			return nil
++		}
++
++		myClientIP := clientIP
++		switch len(ns.ClientIp) {
++		case net.IPv4len, net.IPv6len:
++			myClientIP = net.IP(ns.ClientIp)
++		}
++		client, err := NewClient(ctx, ns, myClientIP, geoipContainer, &matcherInfos, updateDomain)
++		if err != nil {
++			return nil, newError("failed to create client").Base(err)
++		}
++		clients = append(clients, client)
++	}
++
++	// If there is no DNS client in config, add a `localhost` DNS client
++	if len(clients) == 0 {
++		clients = append(clients, NewLocalDNSClient())
++	}
++
++	return &DNS{
++		tag:           tag,
++		hosts:         hosts,
++		clients:       clients,
++		ctx:           ctx,
++		domainMatcher: domainMatcher,
++		matcherInfos:  matcherInfos,
++		disableCache:  config.DisableCache,
++	}, nil
++}
++
++// Type implements common.HasType.
++func (*DNS) Type() interface{} {
++	return dns.ClientType()
++}
++
++// Start implements common.Runnable.
++func (s *DNS) Start() error {
++	return nil
++}
++
++// Close implements common.Closable.
++func (s *DNS) Close() error {
++	return nil
++}
++
++// IsOwnLink implements proxy.dns.ownLinkVerifier
++func (s *DNS) IsOwnLink(ctx context.Context) bool {
++	inbound := session.InboundFromContext(ctx)
++	return inbound != nil && inbound.Tag == s.tag
++}
++
++// LookupIP implements dns.Client.
++func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, error) {
++	if domain == "" {
++		return nil, newError("empty domain name")
++	}
++
++	// Normalize the FQDN form query
++	if strings.HasSuffix(domain, ".") {
++		domain = domain[:len(domain)-1]
++	}
++
++	// Static host lookup
++	switch addrs := s.hosts.Lookup(domain, option); {
++	case addrs == nil: // Domain not recorded in static host
++		break
++	case len(addrs) == 0: // Domain recorded, but no valid IP returned (e.g. IPv4 address with only IPv6 enabled)
++		return nil, dns.ErrEmptyResponse
++	case len(addrs) == 1 && addrs[0].Family().IsDomain(): // Domain replacement
++		newError("domain replaced: ", domain, " -> ", addrs[0].Domain()).WriteToLog()
++		domain = addrs[0].Domain()
++	default: // Successfully found ip records in static host
++		newError("returning ", len(addrs), " IPs for domain ", domain).WriteToLog()
++		return toNetIP(addrs)
++	}
++
++	// Name servers lookup
++	errs := []error{}
++	ctx := session.ContextWithInbound(s.ctx, &session.Inbound{Tag: s.tag})
++	for _, client := range s.sortClients(domain) {
++		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
++			newError("skip DNS resolution for domain ", domain, " at server ", client.Name()).AtDebug().WriteToLog()
++			continue
++		}
++		ips, err := client.QueryIP(ctx, domain, option, s.disableCache)
++		if len(ips) > 0 {
++			return ips, nil
++		}
++		if err != nil {
++			newError("failed to lookup ip for domain ", domain, " at server ", client.Name()).Base(err).WriteToLog()
++			errs = append(errs, err)
++		}
++		if err != context.Canceled && err != context.DeadlineExceeded && err != errExpectedIPNonMatch {
++			return nil, err
++		}
++	}
++
++	return nil, newError("returning nil for domain ", domain).Base(errors.Combine(errs...))
++}
++
++func (s *DNS) sortClients(domain string) []*Client {
++	clients := make([]*Client, 0, len(s.clients))
++	clientUsed := make([]bool, len(s.clients))
++	clientNames := make([]string, 0, len(s.clients))
++	domainRules := []string{}
++
++	// Priority domain matching
++	for _, match := range s.domainMatcher.Match(domain) {
++		info := s.matcherInfos[match]
++		client := s.clients[info.clientIdx]
++		domainRule := client.domains[info.domainRuleIdx]
++		domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", domainRule, info.clientIdx))
++		if clientUsed[info.clientIdx] {
++			continue
++		}
++		clientUsed[info.clientIdx] = true
++		clients = append(clients, client)
++		clientNames = append(clientNames, client.Name())
++	}
++
++	// Default round-robin query
++	for idx, client := range s.clients {
++		if clientUsed[idx] {
++			continue
++		}
++		clientUsed[idx] = true
++		clients = append(clients, client)
++		clientNames = append(clientNames, client.Name())
++	}
++
++	if len(domainRules) > 0 {
++		newError("domain ", domain, " matches following rules: ", domainRules).AtDebug().WriteToLog()
++	}
++	if len(clientNames) > 0 {
++		newError("domain ", domain, " will use DNS in order: ", clientNames).AtDebug().WriteToLog()
++	}
++	return clients
++}
++
++func init() {
++	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
++		return New(ctx, config.(*Config))
++	}))
++}
+diff --git a/app/dns/server_test.go b/app/dns/dns_test.go
+similarity index 100%
+rename from app/dns/server_test.go
+rename to app/dns/dns_test.go
+diff --git a/app/dns/hosts.go b/app/dns/hosts.go
+index 0b58478..af31580 100644
+--- a/app/dns/hosts.go
++++ b/app/dns/hosts.go
+@@ -14,25 +14,6 @@ type StaticHosts struct {
+ 	matchers *strmatcher.MatcherGroup
+ }
+ 
+-var typeMap = map[DomainMatchingType]strmatcher.Type{
+-	DomainMatchingType_Full:      strmatcher.Full,
+-	DomainMatchingType_Subdomain: strmatcher.Domain,
+-	DomainMatchingType_Keyword:   strmatcher.Substr,
+-	DomainMatchingType_Regex:     strmatcher.Regex,
+-}
+-
+-func toStrMatcher(t DomainMatchingType, domain string) (strmatcher.Matcher, error) {
+-	strMType, f := typeMap[t]
+-	if !f {
+-		return nil, newError("unknown mapping type", t).AtWarning()
+-	}
+-	matcher, err := strMType.New(domain)
+-	if err != nil {
+-		return nil, newError("failed to create str matcher").Base(err)
+-	}
+-	return matcher, nil
+-}
+-
+ // NewStaticHosts creates a new StaticHosts instance.
+ func NewStaticHosts(hosts []*Config_HostMapping, legacy map[string]*net.IPOrDomain) (*StaticHosts, error) {
+ 	g := new(strmatcher.MatcherGroup)
+@@ -100,24 +81,38 @@ func filterIP(ips []net.Address, option dns.IPOption) []net.Address {
+ 			filtered = append(filtered, ip)
+ 		}
+ 	}
+-	if len(filtered) == 0 {
+-		return nil
+-	}
+ 	return filtered
+ }
+ 
+-// LookupIP returns IP address for the given domain, if exists in this StaticHosts.
+-func (h *StaticHosts) LookupIP(domain string, option dns.IPOption) []net.Address {
+-	indices := h.matchers.Match(domain)
+-	if len(indices) == 0 {
+-		return nil
+-	}
+-	ips := []net.Address{}
+-	for _, id := range indices {
++func (h *StaticHosts) lookupInternal(domain string) []net.Address {
++	var ips []net.Address
++	for _, id := range h.matchers.Match(domain) {
+ 		ips = append(ips, h.ips[id]...)
+ 	}
+ 	if len(ips) == 1 && ips[0].Family().IsDomain() {
+ 		return ips
+ 	}
+-	return filterIP(ips, option)
++	return ips
++}
++
++func (h *StaticHosts) lookup(domain string, option dns.IPOption, maxDepth int) []net.Address {
++	switch addrs := h.lookupInternal(domain); {
++	case len(addrs) == 0: // Not recorded in static hosts, return nil
++		return nil
++	case len(addrs) == 1 && addrs[0].Family().IsDomain(): // Try to unwrap domain
++		if maxDepth > 0 {
++			unwrapped := h.lookup(addrs[0].Domain(), option, maxDepth-1)
++			if unwrapped != nil {
++				return unwrapped
++			}
++		}
++		return addrs
++	default: // IP record found, return a non-nil IP array
++		return filterIP(addrs, option)
++	}
++}
++
++// Lookup returns IP addresses or proxied domain for the given domain, if exists in this StaticHosts.
++func (h *StaticHosts) Lookup(domain string, option dns.IPOption) []net.Address {
++	return h.lookup(domain, option, 5)
+ }
+diff --git a/app/dns/hosts_test.go b/app/dns/hosts_test.go
+index 2d6929a..87e487b 100644
+--- a/app/dns/hosts_test.go
++++ b/app/dns/hosts_test.go
+@@ -40,7 +40,7 @@ func TestStaticHosts(t *testing.T) {
+ 	common.Must(err)
+ 
+ 	{
+-		ips := hosts.LookupIP("example.com", dns.IPOption{
++		ips := hosts.Lookup("example.com", dns.IPOption{
+ 			IPv4Enable: true,
+ 			IPv6Enable: true,
+ 		})
+@@ -53,7 +53,7 @@ func TestStaticHosts(t *testing.T) {
+ 	}
+ 
+ 	{
+-		ips := hosts.LookupIP("www.example.cn", dns.IPOption{
++		ips := hosts.Lookup("www.example.cn", dns.IPOption{
+ 			IPv4Enable: true,
+ 			IPv6Enable: true,
+ 		})
+@@ -66,7 +66,7 @@ func TestStaticHosts(t *testing.T) {
+ 	}
+ 
+ 	{
+-		ips := hosts.LookupIP("baidu.com", dns.IPOption{
++		ips := hosts.Lookup("baidu.com", dns.IPOption{
+ 			IPv4Enable: false,
+ 			IPv6Enable: true,
+ 		})
+diff --git a/app/dns/nameserver.go b/app/dns/nameserver.go
+index 2b55709..36341f6 100644
+--- a/app/dns/nameserver.go
++++ b/app/dns/nameserver.go
+@@ -2,40 +2,209 @@ package dns
+ 
+ import (
+ 	"context"
++	"net/url"
++	"strings"
++	"time"
+ 
++	"github.com/xtls/xray-core/app/router"
++	"github.com/xtls/xray-core/common/errors"
+ 	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/strmatcher"
++	core "github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/dns"
+-	"github.com/xtls/xray-core/features/dns/localdns"
++	"github.com/xtls/xray-core/features/routing"
+ )
+ 
+-// Client is the interface for DNS client.
+-type Client interface {
++// Server is the interface for Name Server.
++type Server interface {
+ 	// Name of the Client.
+ 	Name() string
+-
+ 	// QueryIP sends IP queries to its configured server.
+-	QueryIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, error)
++	QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns.IPOption, disableCache bool) ([]net.IP, error)
+ }
+ 
+-type LocalNameServer struct {
+-	client *localdns.Client
++// Client is the interface for DNS client.
++type Client struct {
++	server    Server
++	clientIP  net.IP
++	domains   []string
++	expectIPs []*router.GeoIPMatcher
+ }
+ 
+-func (s *LocalNameServer) QueryIP(_ context.Context, domain string, option dns.IPOption) ([]net.IP, error) {
+-	if option.IPv4Enable || option.IPv6Enable {
+-		return s.client.LookupIP(domain, option)
++var errExpectedIPNonMatch = errors.New("expectIPs not match")
++
++// NewServer creates a name server object according to the network destination url.
++func NewServer(dest net.Destination, dispatcher routing.Dispatcher) (Server, error) {
++	if address := dest.Address; address.Family().IsDomain() {
++		u, err := url.Parse(address.Domain())
++		if err != nil {
++			return nil, err
++		}
++		switch {
++		case strings.EqualFold(u.String(), "localhost"):
++			return NewLocalNameServer(), nil
++		case strings.EqualFold(u.Scheme, "https"): // DOH Remote mode
++			return NewDoHNameServer(u, dispatcher)
++		case strings.EqualFold(u.Scheme, "https+local"): // DOH Local mode
++			return NewDoHLocalNameServer(u), nil
++		case strings.EqualFold(u.Scheme, "quic+local"): // DNS-over-QUIC Local mode
++			return NewQUICNameServer(u)
++		case strings.EqualFold(u.String(), "fakedns"):
++			return NewFakeDNSServer(), nil
++		}
++	}
++	if dest.Network == net.Network_Unknown {
++		dest.Network = net.Network_UDP
++	}
++	if dest.Network == net.Network_UDP { // UDP classic DNS mode
++		return NewClassicNameServer(dest, dispatcher), nil
+ 	}
++	return nil, newError("No available name server could be created from ", dest).AtWarning()
++}
++
++// NewClient creates a DNS client managing a name server with client IP, domain rules and expected IPs.
++func NewClient(ctx context.Context, ns *NameServer, clientIP net.IP, container router.GeoIPMatcherContainer, matcherInfos *[]DomainMatcherInfo, updateDomainRule func(strmatcher.Matcher, int, []DomainMatcherInfo) error) (*Client, error) {
++	client := &Client{}
++	err := core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
++		// Create a new server for each client for now
++		server, err := NewServer(ns.Address.AsDestination(), dispatcher)
++		if err != nil {
++			return newError("failed to create nameserver").Base(err).AtWarning()
++		}
++
++		// Priotize local domains with specific TLDs or without any dot to local DNS
++		if _, isLocalDNS := server.(*LocalNameServer); isLocalDNS {
++			ns.PrioritizedDomain = append(ns.PrioritizedDomain, localTLDsAndDotlessDomains...)
++			ns.OriginalRules = append(ns.OriginalRules, localTLDsAndDotlessDomainsRule)
++			// The following lines is a solution to avoid core panics（rule index out of range） when setting `localhost` DNS client in config.
++			// Because the `localhost` DNS client will apend len(localTLDsAndDotlessDomains) rules into matcherInfos to match `geosite:private` default rule.
++			// But `matcherInfos` has no enough length to add rules, which leads to core panics (rule index out of range).
++			// To avoid this, the length of `matcherInfos` must be equal to the expected, so manually append it with Golang default zero value first for later modification.
++			for i := 0; i < len(localTLDsAndDotlessDomains); i++ {
++				*matcherInfos = append(*matcherInfos, DomainMatcherInfo{
++					clientIdx:     uint16(0),
++					domainRuleIdx: uint16(0),
++				})
++			}
++		}
++
++		// Establish domain rules
++		var rules []string
++		ruleCurr := 0
++		ruleIter := 0
++		for _, domain := range ns.PrioritizedDomain {
++			domainRule, err := toStrMatcher(domain.Type, domain.Domain)
++			if err != nil {
++				return newError("failed to create prioritized domain").Base(err).AtWarning()
++			}
++			originalRuleIdx := ruleCurr
++			if ruleCurr < len(ns.OriginalRules) {
++				rule := ns.OriginalRules[ruleCurr]
++				if ruleCurr >= len(rules) {
++					rules = append(rules, rule.Rule)
++				}
++				ruleIter++
++				if ruleIter >= int(rule.Size) {
++					ruleIter = 0
++					ruleCurr++
++				}
++			} else { // No original rule, generate one according to current domain matcher (majorly for compatibility with tests)
++				rules = append(rules, domainRule.String())
++				ruleCurr++
++			}
++			err = updateDomainRule(domainRule, originalRuleIdx, *matcherInfos)
++			if err != nil {
++				return newError("failed to create prioritized domain").Base(err).AtWarning()
++			}
++		}
++
++		// Establish expected IPs
++		var matchers []*router.GeoIPMatcher
++		for _, geoip := range ns.Geoip {
++			matcher, err := container.Add(geoip)
++			if err != nil {
++				return newError("failed to create ip matcher").Base(err).AtWarning()
++			}
++			matchers = append(matchers, matcher)
++		}
++
++		if len(clientIP) > 0 {
++			switch ns.Address.Address.GetAddress().(type) {
++			case *net.IPOrDomain_Domain:
++				newError("DNS: client ", ns.Address.Address.GetDomain(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
++			case *net.IPOrDomain_Ip:
++				newError("DNS: client ", ns.Address.Address.GetIp(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
++			}
++		}
+ 
+-	return nil, newError("neither IPv4 nor IPv6 is enabled")
++		client.server = server
++		client.clientIP = clientIP
++		client.domains = rules
++		client.expectIPs = matchers
++		return nil
++	})
++	return client, err
+ }
+ 
+-func (s *LocalNameServer) Name() string {
+-	return "localhost"
++// NewSimpleClient creates a DNS client with a simple destination.
++func NewSimpleClient(ctx context.Context, endpoint *net.Endpoint, clientIP net.IP) (*Client, error) {
++	client := &Client{}
++	err := core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
++		server, err := NewServer(endpoint.AsDestination(), dispatcher)
++		if err != nil {
++			return newError("failed to create nameserver").Base(err).AtWarning()
++		}
++		client.server = server
++		client.clientIP = clientIP
++		return nil
++	})
++
++	if len(clientIP) > 0 {
++		switch endpoint.Address.GetAddress().(type) {
++		case *net.IPOrDomain_Domain:
++			newError("DNS: client ", endpoint.Address.GetDomain(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
++		case *net.IPOrDomain_Ip:
++			newError("DNS: client ", endpoint.Address.GetIp(), " uses clientIP ", clientIP.String()).AtInfo().WriteToLog()
++		}
++	}
++
++	return client, err
+ }
+ 
+-func NewLocalNameServer() *LocalNameServer {
+-	newError("DNS: created localhost client").AtInfo().WriteToLog()
+-	return &LocalNameServer{
+-		client: localdns.New(),
++// Name returns the server name the client manages.
++func (c *Client) Name() string {
++	return c.server.Name()
++}
++
++// QueryIP send DNS query to the name server with the client's IP.
++func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption, disableCache bool) ([]net.IP, error) {
++	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
++	ips, err := c.server.QueryIP(ctx, domain, c.clientIP, option, disableCache)
++	cancel()
++
++	if err != nil {
++		return ips, err
++	}
++	return c.MatchExpectedIPs(domain, ips)
++}
++
++// MatchExpectedIPs matches queried domain IPs with expected IPs and returns matched ones.
++func (c *Client) MatchExpectedIPs(domain string, ips []net.IP) ([]net.IP, error) {
++	if len(c.expectIPs) == 0 {
++		return ips, nil
++	}
++	newIps := []net.IP{}
++	for _, ip := range ips {
++		for _, matcher := range c.expectIPs {
++			if matcher.Match(ip) {
++				newIps = append(newIps, ip)
++				break
++			}
++		}
++	}
++	if len(newIps) == 0 {
++		return nil, errExpectedIPNonMatch
+ 	}
++	newError("domain ", domain, " expectIPs ", newIps, " matched at server ", c.Name()).AtDebug().WriteToLog()
++	return newIps, nil
+ }
+diff --git a/app/dns/dohdns.go b/app/dns/nameserver_doh.go
+similarity index 89%
+rename from app/dns/dohdns.go
+rename to app/dns/nameserver_doh.go
+index c863a5d..2022ad9 100644
+--- a/app/dns/dohdns.go
++++ b/app/dns/nameserver_doh.go
+@@ -42,10 +42,10 @@ type DoHNameServer struct {
+ 	name       string
+ }
+ 
+-// NewDoHNameServer creates DOH client object for remote resolving
+-func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, clientIP net.IP) (*DoHNameServer, error) {
++// NewDoHNameServer creates DOH server object for remote resolving
++func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher) (*DoHNameServer, error) {
+ 	newError("DNS: created Remote DOH client for ", url.String()).AtInfo().WriteToLog()
+-	s := baseDOHNameServer(url, "DOH", clientIP)
++	s := baseDOHNameServer(url, "DOH")
+ 
+ 	s.dispatcher = dispatcher
+ 	tr := &http.Transport{
+@@ -104,9 +104,9 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, clientIP net.
+ }
+ 
+ // NewDoHLocalNameServer creates DOH client object for local resolving
+-func NewDoHLocalNameServer(url *url.URL, clientIP net.IP) *DoHNameServer {
++func NewDoHLocalNameServer(url *url.URL) *DoHNameServer {
+ 	url.Scheme = "https"
+-	s := baseDOHNameServer(url, "DOHL", clientIP)
++	s := baseDOHNameServer(url, "DOHL")
+ 	tr := &http.Transport{
+ 		IdleConnTimeout:   90 * time.Second,
+ 		ForceAttemptHTTP2: true,
+@@ -136,13 +136,12 @@ func NewDoHLocalNameServer(url *url.URL, clientIP net.IP) *DoHNameServer {
+ 	return s
+ }
+ 
+-func baseDOHNameServer(url *url.URL, prefix string, clientIP net.IP) *DoHNameServer {
++func baseDOHNameServer(url *url.URL, prefix string) *DoHNameServer {
+ 	s := &DoHNameServer{
+-		ips:      make(map[string]record),
+-		clientIP: clientIP,
+-		pub:      pubsub.NewService(),
+-		name:     prefix + "//" + url.Host,
+-		dohURL:   url.String(),
++		ips:    make(map[string]record),
++		pub:    pubsub.NewService(),
++		name:   prefix + "//" + url.Host,
++		dohURL: url.String(),
+ 	}
+ 	s.cleanup = &task.Periodic{
+ 		Interval: time.Minute,
+@@ -152,7 +151,7 @@ func baseDOHNameServer(url *url.URL, prefix string, clientIP net.IP) *DoHNameSer
+ 	return s
+ }
+ 
+-// Name returns client name
++// Name implements Server.
+ func (s *DoHNameServer) Name() string {
+ 	return s.name
+ }
+@@ -235,7 +234,7 @@ func (s *DoHNameServer) newReqID() uint16 {
+ 	return uint16(atomic.AddUint32(&s.reqID, 1))
+ }
+ 
+-func (s *DoHNameServer) sendQuery(ctx context.Context, domain string, option dns_feature.IPOption) {
++func (s *DoHNameServer) sendQuery(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption) {
+ 	newError(s.name, " querying: ", domain).AtInfo().WriteToLog(session.ExportIDToError(ctx))
+ 
+ 	if s.name+"." == "DOH//"+domain {
+@@ -243,7 +242,7 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, domain string, option dns
+ 		return
+ 	}
+ 
+-	reqs := buildReqMsgs(domain, option, s.newReqID, genEDNS0Options(s.clientIP))
++	reqs := buildReqMsgs(domain, option, s.newReqID, genEDNS0Options(clientIP))
+ 
+ 	var deadline time.Time
+ 	if d, ok := ctx.Deadline(); ok {
+@@ -264,8 +263,8 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, domain string, option dns
+ 			}
+ 
+ 			dnsCtx = session.ContextWithContent(dnsCtx, &session.Content{
+-				Protocol: "https",
+-				//SkipRoutePick: true,
++				Protocol:       "https",
++				SkipDNSResolve: true,
+ 			})
+ 
+ 			// forced to use mux for DOH
+@@ -349,7 +348,7 @@ func (s *DoHNameServer) findIPsForDomain(domain string, option dns_feature.IPOpt
+ 	}
+ 
+ 	if len(ips) > 0 {
+-		return toNetIP(ips), nil
++		return toNetIP(ips)
+ 	}
+ 
+ 	if lastErr != nil {
+@@ -363,15 +362,18 @@ func (s *DoHNameServer) findIPsForDomain(domain string, option dns_feature.IPOpt
+ 	return nil, errRecordNotFound
+ }
+ 
+-// QueryIP is called from dns.Server->queryIPTimeout
+-func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, error) { // nolint: dupl
++// QueryIP implements Server.
++func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption, disableCache bool) ([]net.IP, error) { // nolint: dupl
+ 	fqdn := Fqdn(domain)
+ 
+-	ips, err := s.findIPsForDomain(fqdn, option)
+-	if err != errRecordNotFound {
+-		newError(s.name, " cache HIT ", domain, " -> ", ips).Base(err).AtDebug().WriteToLog()
+-		log.Record(&log.DNSLog{s.name, domain, ips, log.DNSCacheHit, 0, err})
+-		return ips, err
++	if disableCache {
++		newError("DNS cache is disabled. Querying IP for ", domain, " at ", s.name).AtDebug().WriteToLog()
++	} else {
++		ips, err := s.findIPsForDomain(fqdn, option)
++		if err != errRecordNotFound {
++			newError(s.name, " cache HIT ", domain, " -> ", ips).Base(err).AtDebug().WriteToLog()
++			return ips, err
++		}
+ 	}
+ 
+ 	// ipv4 and ipv6 belong to different subscription groups
+@@ -400,7 +402,7 @@ func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_f
+ 		}
+ 		close(done)
+ 	}()
+-	s.sendQuery(ctx, fqdn, option)
++	s.sendQuery(ctx, fqdn, clientIP, option)
+ 	start := time.Now()
+ 
+ 	for {
+diff --git a/app/dns/nameserver_doh_test.go b/app/dns/nameserver_doh_test.go
+new file mode 100644
+index 0000000..cc12c7a
+--- /dev/null
++++ b/app/dns/nameserver_doh_test.go
+@@ -0,0 +1,60 @@
++package dns_test
++
++import (
++	"context"
++	"net/url"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++
++	. "github.com/xtls/xray-core/app/dns"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	dns_feature "github.com/xtls/xray-core/features/dns"
++)
++
++func TestDOHNameServer(t *testing.T) {
++	url, err := url.Parse("https+local://1.1.1.1/dns-query")
++	common.Must(err)
++
++	s := NewDoHLocalNameServer(url)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
++	ips, err := s.QueryIP(ctx, "google.com", net.IP(nil), dns_feature.IPOption{
++		IPv4Enable: true,
++		IPv6Enable: true,
++	}, false)
++	cancel()
++	common.Must(err)
++	if len(ips) == 0 {
++		t.Error("expect some ips, but got 0")
++	}
++}
++
++func TestDOHNameServerWithCache(t *testing.T) {
++	url, err := url.Parse("https+local://1.1.1.1/dns-query")
++	common.Must(err)
++
++	s := NewDoHLocalNameServer(url)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
++	ips, err := s.QueryIP(ctx, "google.com", net.IP(nil), dns_feature.IPOption{
++		IPv4Enable: true,
++		IPv6Enable: true,
++	}, false)
++	cancel()
++	common.Must(err)
++	if len(ips) == 0 {
++		t.Error("expect some ips, but got 0")
++	}
++
++	ctx2, cancel := context.WithTimeout(context.Background(), time.Second*2)
++	ips2, err := s.QueryIP(ctx2, "google.com", net.IP(nil), dns_feature.IPOption{
++		IPv4Enable: true,
++		IPv6Enable: true,
++	}, true)
++	cancel()
++	common.Must(err)
++	if r := cmp.Diff(ips2, ips); r != "" {
++		t.Fatal(r)
++	}
++}
+diff --git a/app/dns/nameserver_fakedns.go b/app/dns/nameserver_fakedns.go
+index 32d8bcd..54476ac 100644
+--- a/app/dns/nameserver_fakedns.go
++++ b/app/dns/nameserver_fakedns.go
+@@ -20,7 +20,7 @@ func (FakeDNSServer) Name() string {
+ 	return "FakeDNS"
+ }
+ 
+-func (f *FakeDNSServer) QueryIP(ctx context.Context, domain string, _ dns.IPOption) ([]net.IP, error) {
++func (f *FakeDNSServer) QueryIP(ctx context.Context, domain string, _ net.IP, _ dns.IPOption, _ bool) ([]net.IP, error) {
+ 	if f.fakeDNSEngine == nil {
+ 		if err := core.RequireFeatures(ctx, func(fd dns.FakeDNSEngine) {
+ 			f.fakeDNSEngine = fd
+@@ -30,9 +30,9 @@ func (f *FakeDNSServer) QueryIP(ctx context.Context, domain string, _ dns.IPOpti
+ 	}
+ 	ips := f.fakeDNSEngine.GetFakeIPForDomain(domain)
+ 
+-	netIP := toNetIP(ips)
+-	if netIP == nil {
+-		return nil, newError("Unable to convert IP to net ip").AtError()
++	netIP, err := toNetIP(ips)
++	if err != nil {
++		return nil, newError("Unable to convert IP to net ip").Base(err).AtError()
+ 	}
+ 
+ 	newError(f.Name(), " got answer: ", domain, " -> ", ips).AtInfo().WriteToLog()
+diff --git a/app/dns/nameserver_local.go b/app/dns/nameserver_local.go
+new file mode 100644
+index 0000000..0ebc1dd
+--- /dev/null
++++ b/app/dns/nameserver_local.go
+@@ -0,0 +1,41 @@
++package dns
++
++import (
++	"context"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/features/dns"
++	"github.com/xtls/xray-core/features/dns/localdns"
++)
++
++// LocalNameServer is an wrapper over local DNS feature.
++type LocalNameServer struct {
++	client *localdns.Client
++}
++
++// QueryIP implements Server.
++func (s *LocalNameServer) QueryIP(_ context.Context, domain string, _ net.IP, option dns.IPOption, _ bool) ([]net.IP, error) {
++	if option.IPv4Enable || option.IPv6Enable {
++		return s.client.LookupIP(domain, option)
++	}
++
++	return nil, newError("neither IPv4 nor IPv6 is enabled")
++}
++
++// Name implements Server.
++func (s *LocalNameServer) Name() string {
++	return "localhost"
++}
++
++// NewLocalNameServer creates localdns server object for directly lookup in system DNS.
++func NewLocalNameServer() *LocalNameServer {
++	newError("DNS: created localhost client").AtInfo().WriteToLog()
++	return &LocalNameServer{
++		client: localdns.New(),
++	}
++}
++
++// NewLocalDNSClient creates localdns client object for directly lookup in system DNS.
++func NewLocalDNSClient() *Client {
++	return &Client{server: NewLocalNameServer()}
++}
+diff --git a/app/dns/nameserver_test.go b/app/dns/nameserver_local_test.go
+similarity index 72%
+rename from app/dns/nameserver_test.go
+rename to app/dns/nameserver_local_test.go
+index 9bd1a4a..f914210 100644
+--- a/app/dns/nameserver_test.go
++++ b/app/dns/nameserver_local_test.go
+@@ -7,17 +7,17 @@ import (
+ 
+ 	. "github.com/xtls/xray-core/app/dns"
+ 	"github.com/xtls/xray-core/common"
+-	dns_feature "github.com/xtls/xray-core/features/dns"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/features/dns"
+ )
+ 
+ func TestLocalNameServer(t *testing.T) {
+ 	s := NewLocalNameServer()
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+-	ips, err := s.QueryIP(ctx, "google.com", dns_feature.IPOption{
++	ips, err := s.QueryIP(ctx, "google.com", net.IP{}, dns.IPOption{
+ 		IPv4Enable: true,
+ 		IPv6Enable: true,
+-		FakeEnable: false,
+-	})
++	}, false)
+ 	cancel()
+ 	common.Must(err)
+ 	if len(ips) == 0 {
+diff --git a/app/dns/nameserver_quic.go b/app/dns/nameserver_quic.go
+new file mode 100644
+index 0000000..7c38ac9
+--- /dev/null
++++ b/app/dns/nameserver_quic.go
+@@ -0,0 +1,387 @@
++package dns
++
++import (
++	"context"
++	"net/url"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/lucas-clemente/quic-go"
++	"golang.org/x/net/dns/dnsmessage"
++	"golang.org/x/net/http2"
++
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol/dns"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/common/signal/pubsub"
++	"github.com/xtls/xray-core/common/task"
++	dns_feature "github.com/xtls/xray-core/features/dns"
++	"github.com/xtls/xray-core/transport/internet/tls"
++)
++
++// NextProtoDQ - During connection establishment, DNS/QUIC support is indicated
++// by selecting the ALPN token "dq" in the crypto handshake.
++const NextProtoDQ = "doq-i00"
++
++const handshakeTimeout = time.Second * 8
++
++// QUICNameServer implemented DNS over QUIC
++type QUICNameServer struct {
++	sync.RWMutex
++	ips         map[string]record
++	pub         *pubsub.Service
++	cleanup     *task.Periodic
++	reqID       uint32
++	name        string
++	destination net.Destination
++	session     quic.Session
++}
++
++// NewQUICNameServer creates DNS-over-QUIC client object for local resolving
++func NewQUICNameServer(url *url.URL) (*QUICNameServer, error) {
++	newError("DNS: created Local DNS-over-QUIC client for ", url.String()).AtInfo().WriteToLog()
++
++	var err error
++	port := net.Port(784)
++	if url.Port() != "" {
++		port, err = net.PortFromString(url.Port())
++		if err != nil {
++			return nil, err
++		}
++	}
++	dest := net.UDPDestination(net.DomainAddress(url.Hostname()), port)
++
++	s := &QUICNameServer{
++		ips:         make(map[string]record),
++		pub:         pubsub.NewService(),
++		name:        url.String(),
++		destination: dest,
++	}
++	s.cleanup = &task.Periodic{
++		Interval: time.Minute,
++		Execute:  s.Cleanup,
++	}
++
++	return s, nil
++}
++
++// Name returns client name
++func (s *QUICNameServer) Name() string {
++	return s.name
++}
++
++// Cleanup clears expired items from cache
++func (s *QUICNameServer) Cleanup() error {
++	now := time.Now()
++	s.Lock()
++	defer s.Unlock()
++
++	if len(s.ips) == 0 {
++		return newError("nothing to do. stopping...")
++	}
++
++	for domain, record := range s.ips {
++		if record.A != nil && record.A.Expire.Before(now) {
++			record.A = nil
++		}
++		if record.AAAA != nil && record.AAAA.Expire.Before(now) {
++			record.AAAA = nil
++		}
++
++		if record.A == nil && record.AAAA == nil {
++			newError(s.name, " cleanup ", domain).AtDebug().WriteToLog()
++			delete(s.ips, domain)
++		} else {
++			s.ips[domain] = record
++		}
++	}
++
++	if len(s.ips) == 0 {
++		s.ips = make(map[string]record)
++	}
++
++	return nil
++}
++
++func (s *QUICNameServer) updateIP(req *dnsRequest, ipRec *IPRecord) {
++	elapsed := time.Since(req.start)
++
++	s.Lock()
++	rec := s.ips[req.domain]
++	updated := false
++
++	switch req.reqType {
++	case dnsmessage.TypeA:
++		if isNewer(rec.A, ipRec) {
++			rec.A = ipRec
++			updated = true
++		}
++	case dnsmessage.TypeAAAA:
++		addr := make([]net.Address, 0)
++		for _, ip := range ipRec.IP {
++			if len(ip.IP()) == net.IPv6len {
++				addr = append(addr, ip)
++			}
++		}
++		ipRec.IP = addr
++		if isNewer(rec.AAAA, ipRec) {
++			rec.AAAA = ipRec
++			updated = true
++		}
++	}
++	newError(s.name, " got answer: ", req.domain, " ", req.reqType, " -> ", ipRec.IP, " ", elapsed).AtInfo().WriteToLog()
++
++	if updated {
++		s.ips[req.domain] = rec
++	}
++	switch req.reqType {
++	case dnsmessage.TypeA:
++		s.pub.Publish(req.domain+"4", nil)
++	case dnsmessage.TypeAAAA:
++		s.pub.Publish(req.domain+"6", nil)
++	}
++	s.Unlock()
++	common.Must(s.cleanup.Start())
++}
++
++func (s *QUICNameServer) newReqID() uint16 {
++	return uint16(atomic.AddUint32(&s.reqID, 1))
++}
++
++func (s *QUICNameServer) sendQuery(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption) {
++	newError(s.name, " querying: ", domain).AtInfo().WriteToLog(session.ExportIDToError(ctx))
++
++	reqs := buildReqMsgs(domain, option, s.newReqID, genEDNS0Options(clientIP))
++
++	var deadline time.Time
++	if d, ok := ctx.Deadline(); ok {
++		deadline = d
++	} else {
++		deadline = time.Now().Add(time.Second * 5)
++	}
++
++	for _, req := range reqs {
++		go func(r *dnsRequest) {
++			// generate new context for each req, using same context
++			// may cause reqs all aborted if any one encounter an error
++			dnsCtx := context.Background()
++
++			// reserve internal dns server requested Inbound
++			if inbound := session.InboundFromContext(ctx); inbound != nil {
++				dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
++			}
++
++			dnsCtx = session.ContextWithContent(dnsCtx, &session.Content{
++				Protocol:       "quic",
++				SkipDNSResolve: true,
++			})
++
++			var cancel context.CancelFunc
++			dnsCtx, cancel = context.WithDeadline(dnsCtx, deadline)
++			defer cancel()
++
++			b, err := dns.PackMessage(r.msg)
++			if err != nil {
++				newError("failed to pack dns query").Base(err).AtError().WriteToLog()
++				return
++			}
++
++			conn, err := s.openStream(dnsCtx)
++			if err != nil {
++				newError("failed to open quic session").Base(err).AtError().WriteToLog()
++				return
++			}
++
++			_, err = conn.Write(b.Bytes())
++			if err != nil {
++				newError("failed to send query").Base(err).AtError().WriteToLog()
++				return
++			}
++
++			_ = conn.Close()
++
++			respBuf := buf.New()
++			defer respBuf.Release()
++			n, err := respBuf.ReadFrom(conn)
++			if err != nil && n == 0 {
++				newError("failed to read response").Base(err).AtError().WriteToLog()
++				return
++			}
++
++			rec, err := parseResponse(respBuf.Bytes())
++			if err != nil {
++				newError("failed to handle response").Base(err).AtError().WriteToLog()
++				return
++			}
++			s.updateIP(r, rec)
++		}(req)
++	}
++}
++
++func (s *QUICNameServer) findIPsForDomain(domain string, option dns_feature.IPOption) ([]net.IP, error) {
++	s.RLock()
++	record, found := s.ips[domain]
++	s.RUnlock()
++
++	if !found {
++		return nil, errRecordNotFound
++	}
++
++	var ips []net.Address
++	var lastErr error
++	if option.IPv6Enable && record.AAAA != nil && record.AAAA.RCode == dnsmessage.RCodeSuccess {
++		aaaa, err := record.AAAA.getIPs()
++		if err != nil {
++			lastErr = err
++		}
++		ips = append(ips, aaaa...)
++	}
++
++	if option.IPv4Enable && record.A != nil && record.A.RCode == dnsmessage.RCodeSuccess {
++		a, err := record.A.getIPs()
++		if err != nil {
++			lastErr = err
++		}
++		ips = append(ips, a...)
++	}
++
++	if len(ips) > 0 {
++		return toNetIP(ips)
++	}
++
++	if lastErr != nil {
++		return nil, lastErr
++	}
++
++	if (option.IPv4Enable && record.A != nil) || (option.IPv6Enable && record.AAAA != nil) {
++		return nil, dns_feature.ErrEmptyResponse
++	}
++
++	return nil, errRecordNotFound
++}
++
++// QueryIP is called from dns.Server->queryIPTimeout
++func (s *QUICNameServer) QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption, disableCache bool) ([]net.IP, error) {
++	fqdn := Fqdn(domain)
++
++	if disableCache {
++		newError("DNS cache is disabled. Querying IP for ", domain, " at ", s.name).AtDebug().WriteToLog()
++	} else {
++		ips, err := s.findIPsForDomain(fqdn, option)
++		if err != errRecordNotFound {
++			newError(s.name, " cache HIT ", domain, " -> ", ips).Base(err).AtDebug().WriteToLog()
++			return ips, err
++		}
++	}
++
++	// ipv4 and ipv6 belong to different subscription groups
++	var sub4, sub6 *pubsub.Subscriber
++	if option.IPv4Enable {
++		sub4 = s.pub.Subscribe(fqdn + "4")
++		defer sub4.Close()
++	}
++	if option.IPv6Enable {
++		sub6 = s.pub.Subscribe(fqdn + "6")
++		defer sub6.Close()
++	}
++	done := make(chan interface{})
++	go func() {
++		if sub4 != nil {
++			select {
++			case <-sub4.Wait():
++			case <-ctx.Done():
++			}
++		}
++		if sub6 != nil {
++			select {
++			case <-sub6.Wait():
++			case <-ctx.Done():
++			}
++		}
++		close(done)
++	}()
++	s.sendQuery(ctx, fqdn, clientIP, option)
++
++	for {
++		ips, err := s.findIPsForDomain(fqdn, option)
++		if err != errRecordNotFound {
++			return ips, err
++		}
++
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-done:
++		}
++	}
++}
++
++func isActive(s quic.Session) bool {
++	select {
++	case <-s.Context().Done():
++		return false
++	default:
++		return true
++	}
++}
++
++func (s *QUICNameServer) getSession() (quic.Session, error) {
++	var session quic.Session
++	s.RLock()
++	session = s.session
++	if session != nil && isActive(session) {
++		s.RUnlock()
++		return session, nil
++	}
++	if session != nil {
++		// we're recreating the session, let's create a new one
++		_ = session.CloseWithError(0, "")
++	}
++	s.RUnlock()
++
++	s.Lock()
++	defer s.Unlock()
++
++	var err error
++	session, err = s.openSession()
++	if err != nil {
++		// This does not look too nice, but QUIC (or maybe quic-go)
++		// doesn't seem stable enough.
++		// Maybe retransmissions aren't fully implemented in quic-go?
++		// Anyways, the simple solution is to make a second try when
++		// it fails to open the QUIC session.
++		session, err = s.openSession()
++		if err != nil {
++			return nil, err
++		}
++	}
++	s.session = session
++	return session, nil
++}
++
++func (s *QUICNameServer) openSession() (quic.Session, error) {
++	tlsConfig := tls.Config{}
++	quicConfig := &quic.Config{
++		HandshakeTimeout: handshakeTimeout,
++	}
++
++	session, err := quic.DialAddrContext(context.Background(), s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
++	if err != nil {
++		return nil, err
++	}
++
++	return session, nil
++}
++
++func (s *QUICNameServer) openStream(ctx context.Context) (quic.Stream, error) {
++	session, err := s.getSession()
++	if err != nil {
++		return nil, err
++	}
++
++	// open a new stream
++	return session.OpenStreamSync(ctx)
++}
+diff --git a/app/dns/nameserver_quic_test.go b/app/dns/nameserver_quic_test.go
+new file mode 100644
+index 0000000..de3ef6f
+--- /dev/null
++++ b/app/dns/nameserver_quic_test.go
+@@ -0,0 +1,60 @@
++package dns_test
++
++import (
++	"context"
++	"net/url"
++	"testing"
++	"time"
++
++	"github.com/google/go-cmp/cmp"
++
++	. "github.com/xtls/xray-core/app/dns"
++	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/net"
++	dns_feature "github.com/xtls/xray-core/features/dns"
++)
++
++func TestQUICNameServer(t *testing.T) {
++	url, err := url.Parse("quic://dns.adguard.com")
++	common.Must(err)
++	s, err := NewQUICNameServer(url)
++	common.Must(err)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
++	ips, err := s.QueryIP(ctx, "google.com", net.IP(nil), dns_feature.IPOption{
++		IPv4Enable: true,
++		IPv6Enable: true,
++	}, false)
++	cancel()
++	common.Must(err)
++	if len(ips) == 0 {
++		t.Error("expect some ips, but got 0")
++	}
++}
++
++func TestQUICNameServerWithCache(t *testing.T) {
++	url, err := url.Parse("quic://dns.adguard.com")
++	common.Must(err)
++	s, err := NewQUICNameServer(url)
++	common.Must(err)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
++	ips, err := s.QueryIP(ctx, "google.com", net.IP(nil), dns_feature.IPOption{
++		IPv4Enable: true,
++		IPv6Enable: true,
++	}, false)
++	cancel()
++	common.Must(err)
++	if len(ips) == 0 {
++		t.Error("expect some ips, but got 0")
++	}
++
++	ctx2, cancel := context.WithTimeout(context.Background(), time.Second*2)
++	ips2, err := s.QueryIP(ctx2, "google.com", net.IP(nil), dns_feature.IPOption{
++		IPv4Enable: true,
++		IPv6Enable: true,
++	}, true)
++	cancel()
++	common.Must(err)
++	if r := cmp.Diff(ips2, ips); r != "" {
++		t.Fatal(r)
++	}
++}
+diff --git a/app/dns/udpns.go b/app/dns/nameserver_udp.go
+similarity index 89%
+rename from app/dns/udpns.go
+rename to app/dns/nameserver_udp.go
+index 15faa5e..9b7f515 100644
+--- a/app/dns/udpns.go
++++ b/app/dns/nameserver_udp.go
+@@ -2,12 +2,13 @@ package dns
+ 
+ import (
+ 	"context"
+-	"github.com/xtls/xray-core/transport/internet"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/xtls/xray-core/transport/internet"
++
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/log"
+ 	"github.com/xtls/xray-core/common/net"
+@@ -32,10 +33,10 @@ type ClassicNameServer struct {
+ 	udpServer *udp.Dispatcher
+ 	cleanup   *task.Periodic
+ 	reqID     uint32
+-	clientIP  net.IP
+ }
+ 
+-func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher, clientIP net.IP) *ClassicNameServer {
++// NewClassicNameServer creates udp server object for remote resolving.
++func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher) *ClassicNameServer {
+ 	// default to 53 if unspecific
+ 	if address.Port == 0 {
+ 		address.Port = net.Port(53)
+@@ -45,7 +46,6 @@ func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher
+ 		address:  address,
+ 		ips:      make(map[string]record),
+ 		requests: make(map[uint16]dnsRequest),
+-		clientIP: clientIP,
+ 		pub:      pubsub.NewService(),
+ 		name:     strings.ToUpper(address.String()),
+ 	}
+@@ -58,10 +58,12 @@ func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher
+ 	return s
+ }
+ 
++// Name implements Server.
+ func (s *ClassicNameServer) Name() string {
+ 	return s.name
+ }
+ 
++// Cleanup clears expired items from cache
+ func (s *ClassicNameServer) Cleanup() error {
+ 	now := time.Now()
+ 	s.Lock()
+@@ -103,6 +105,7 @@ func (s *ClassicNameServer) Cleanup() error {
+ 	return nil
+ }
+ 
++// HandleResponse handles udp response packet from remote DNS server.
+ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_proto.Packet) {
+ 	ipRec, err := parseResponse(packet.Payload.Bytes())
+ 	if err != nil {
+@@ -180,10 +183,10 @@ func (s *ClassicNameServer) addPendingRequest(req *dnsRequest) {
+ 	s.requests[id] = *req
+ }
+ 
+-func (s *ClassicNameServer) sendQuery(ctx context.Context, domain string, option dns_feature.IPOption) {
++func (s *ClassicNameServer) sendQuery(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption) {
+ 	newError(s.name, " querying DNS for: ", domain).AtDebug().WriteToLog(session.ExportIDToError(ctx))
+ 
+-	reqs := buildReqMsgs(domain, option, s.newReqID, genEDNS0Options(s.clientIP))
++	reqs := buildReqMsgs(domain, option, s.newReqID, genEDNS0Options(clientIP))
+ 
+ 	for _, req := range reqs {
+ 		s.addPendingRequest(req)
+@@ -234,7 +237,7 @@ func (s *ClassicNameServer) findIPsForDomain(domain string, option dns_feature.I
+ 	}
+ 
+ 	if len(ips) > 0 {
+-		return toNetIP(ips), nil
++		return toNetIP(ips)
+ 	}
+ 
+ 	if lastErr != nil {
+@@ -245,14 +248,17 @@ func (s *ClassicNameServer) findIPsForDomain(domain string, option dns_feature.I
+ }
+ 
+ // QueryIP implements Server.
+-func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, error) {
++func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption, disableCache bool) ([]net.IP, error) {
+ 	fqdn := Fqdn(domain)
+ 
+-	ips, err := s.findIPsForDomain(fqdn, option)
+-	if err != errRecordNotFound {
+-		newError(s.name, " cache HIT ", domain, " -> ", ips).Base(err).AtDebug().WriteToLog()
+-		log.Record(&log.DNSLog{s.name, domain, ips, log.DNSCacheHit, 0, err})
+-		return ips, err
++	if disableCache {
++		newError("DNS cache is disabled. Querying IP for ", domain, " at ", s.name).AtDebug().WriteToLog()
++	} else {
++		ips, err := s.findIPsForDomain(fqdn, option)
++		if err != errRecordNotFound {
++			newError(s.name, " cache HIT ", domain, " -> ", ips).Base(err).AtDebug().WriteToLog()
++			return ips, err
++		}
+ 	}
+ 
+ 	// ipv4 and ipv6 belong to different subscription groups
+@@ -281,7 +287,7 @@ func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option d
+ 		}
+ 		close(done)
+ 	}()
+-	s.sendQuery(ctx, fqdn, option)
++	s.sendQuery(ctx, fqdn, clientIP, option)
+ 	start := time.Now()
+ 
+ 	for {
+diff --git a/app/dns/server.go b/app/dns/server.go
+deleted file mode 100644
+index 0090c99..0000000
+--- a/app/dns/server.go
++++ /dev/null
+@@ -1,439 +0,0 @@
+-package dns
+-
+-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
+-
+-import (
+-	"context"
+-	"fmt"
+-	"log"
+-	"net/url"
+-	"strings"
+-	"sync"
+-	"time"
+-
+-	"github.com/xtls/xray-core/app/router"
+-	"github.com/xtls/xray-core/common"
+-	"github.com/xtls/xray-core/common/errors"
+-	"github.com/xtls/xray-core/common/net"
+-	"github.com/xtls/xray-core/common/session"
+-	"github.com/xtls/xray-core/common/strmatcher"
+-	"github.com/xtls/xray-core/common/uuid"
+-	core "github.com/xtls/xray-core/core"
+-	"github.com/xtls/xray-core/features"
+-	"github.com/xtls/xray-core/features/dns"
+-	"github.com/xtls/xray-core/features/routing"
+-	"github.com/xtls/xray-core/transport/internet"
+-)
+-
+-// Server is a DNS rely server.
+-type Server struct {
+-	sync.Mutex
+-	hosts         *StaticHosts
+-	clientIP      net.IP
+-	clients       []Client // clientIdx -> Client
+-	ctx           context.Context
+-	ipIndexMap    []*MultiGeoIPMatcher // clientIdx -> *MultiGeoIPMatcher
+-	domainRules   [][]string           // clientIdx -> domainRuleIdx -> DomainRule
+-	domainMatcher strmatcher.IndexMatcher
+-	matcherInfos  []DomainMatcherInfo // matcherIdx -> DomainMatcherInfo
+-	tag           string
+-}
+-
+-// DomainMatcherInfo contains information attached to index returned by Server.domainMatcher
+-type DomainMatcherInfo struct {
+-	clientIdx     uint16
+-	domainRuleIdx uint16
+-}
+-
+-// MultiGeoIPMatcher for match
+-type MultiGeoIPMatcher struct {
+-	matchers []*router.GeoIPMatcher
+-}
+-
+-var errExpectedIPNonMatch = errors.New("expectIPs not match")
+-
+-// Match check ip match
+-func (c *MultiGeoIPMatcher) Match(ip net.IP) bool {
+-	for _, matcher := range c.matchers {
+-		if matcher.Match(ip) {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+-// HasMatcher check has matcher
+-func (c *MultiGeoIPMatcher) HasMatcher() bool {
+-	return len(c.matchers) > 0
+-}
+-
+-func generateRandomTag() string {
+-	id := uuid.New()
+-	return "xray.system." + id.String()
+-}
+-
+-// New creates a new DNS server with given configuration.
+-func New(ctx context.Context, config *Config) (*Server, error) {
+-	server := &Server{
+-		clients: make([]Client, 0, len(config.NameServers)+len(config.NameServer)),
+-		ctx:     ctx,
+-		tag:     config.Tag,
+-	}
+-	if server.tag == "" {
+-		server.tag = generateRandomTag()
+-	}
+-	if len(config.ClientIp) > 0 {
+-		if len(config.ClientIp) != net.IPv4len && len(config.ClientIp) != net.IPv6len {
+-			return nil, newError("unexpected IP length", len(config.ClientIp))
+-		}
+-		server.clientIP = net.IP(config.ClientIp)
+-	}
+-
+-	hosts, err := NewStaticHosts(config.StaticHosts, config.Hosts)
+-	if err != nil {
+-		return nil, newError("failed to create hosts").Base(err)
+-	}
+-	server.hosts = hosts
+-
+-	addNameServer := func(ns *NameServer) int {
+-		endpoint := ns.Address
+-		address := endpoint.Address.AsAddress()
+-
+-		switch {
+-		case address.Family().IsDomain() && address.Domain() == "localhost":
+-			server.clients = append(server.clients, NewLocalNameServer())
+-			// Priotize local domains with specific TLDs or without any dot to local DNS
+-			// References:
+-			// https://www.iana.org/assignments/special-use-domain-names/special-use-domain-names.xhtml
+-			// https://unix.stackexchange.com/questions/92441/whats-the-difference-between-local-home-and-lan
+-			localTLDsAndDotlessDomains := []*NameServer_PriorityDomain{
+-				{Type: DomainMatchingType_Regex, Domain: "^[^.]+$"}, // This will only match domains without any dot
+-				{Type: DomainMatchingType_Subdomain, Domain: "local"},
+-				{Type: DomainMatchingType_Subdomain, Domain: "localdomain"},
+-				{Type: DomainMatchingType_Subdomain, Domain: "localhost"},
+-				{Type: DomainMatchingType_Subdomain, Domain: "lan"},
+-				{Type: DomainMatchingType_Subdomain, Domain: "home.arpa"},
+-				{Type: DomainMatchingType_Subdomain, Domain: "example"},
+-				{Type: DomainMatchingType_Subdomain, Domain: "invalid"},
+-				{Type: DomainMatchingType_Subdomain, Domain: "test"},
+-			}
+-			ns.PrioritizedDomain = append(ns.PrioritizedDomain, localTLDsAndDotlessDomains...)
+-
+-		case address.Family().IsDomain() && strings.HasPrefix(address.Domain(), "https+local://"):
+-			// URI schemed string treated as domain
+-			// DOH Local mode
+-			u, err := url.Parse(address.Domain())
+-			if err != nil {
+-				log.Fatalln(newError("DNS config error").Base(err))
+-			}
+-			server.clients = append(server.clients, NewDoHLocalNameServer(u, server.clientIP))
+-
+-		case address.Family().IsDomain() && strings.HasPrefix(address.Domain(), "https://"):
+-			// DOH Remote mode
+-			u, err := url.Parse(address.Domain())
+-			if err != nil {
+-				log.Fatalln(newError("DNS config error").Base(err))
+-			}
+-			idx := len(server.clients)
+-			server.clients = append(server.clients, nil)
+-
+-			// need the core dispatcher, register DOHClient at callback
+-			common.Must(core.RequireFeatures(ctx, func(d routing.Dispatcher) {
+-				c, err := NewDoHNameServer(u, d, server.clientIP)
+-				if err != nil {
+-					log.Fatalln(newError("DNS config error").Base(err))
+-				}
+-				server.clients[idx] = c
+-			}))
+-
+-		case address.Family().IsDomain() && address.Domain() == "fakedns":
+-			server.clients = append(server.clients, NewFakeDNSServer())
+-
+-		default:
+-			// UDP classic DNS mode
+-			dest := endpoint.AsDestination()
+-			if dest.Network == net.Network_Unknown {
+-				dest.Network = net.Network_UDP
+-			}
+-			if dest.Network == net.Network_UDP {
+-				idx := len(server.clients)
+-				server.clients = append(server.clients, nil)
+-
+-				common.Must(core.RequireFeatures(ctx, func(d routing.Dispatcher) {
+-					server.clients[idx] = NewClassicNameServer(dest, d, server.clientIP)
+-				}))
+-			}
+-		}
+-		server.ipIndexMap = append(server.ipIndexMap, nil)
+-		return len(server.clients) - 1
+-	}
+-
+-	if len(config.NameServers) > 0 {
+-		features.PrintDeprecatedFeatureWarning("simple DNS server")
+-		for _, destPB := range config.NameServers {
+-			addNameServer(&NameServer{Address: destPB})
+-		}
+-	}
+-
+-	if len(config.NameServer) > 0 {
+-		clientIndices := []int{}
+-		domainRuleCount := 0
+-		for _, ns := range config.NameServer {
+-			idx := addNameServer(ns)
+-			clientIndices = append(clientIndices, idx)
+-			domainRuleCount += len(ns.PrioritizedDomain)
+-		}
+-
+-		domainRules := make([][]string, len(server.clients))
+-		domainMatcher := &strmatcher.MatcherGroup{}
+-		matcherInfos := make([]DomainMatcherInfo, domainRuleCount+1) // matcher index starts from 1
+-		var geoIPMatcherContainer router.GeoIPMatcherContainer
+-		for nidx, ns := range config.NameServer {
+-			idx := clientIndices[nidx]
+-
+-			// Establish domain rule matcher
+-			rules := []string{}
+-			ruleCurr := 0
+-			ruleIter := 0
+-			for _, domain := range ns.PrioritizedDomain {
+-				matcher, err := toStrMatcher(domain.Type, domain.Domain)
+-				if err != nil {
+-					return nil, newError("failed to create prioritized domain").Base(err).AtWarning()
+-				}
+-				midx := domainMatcher.Add(matcher)
+-				if midx >= uint32(len(matcherInfos)) { // This rarely happens according to current matcher's implementation
+-					newError("expanding domain matcher info array to size ", midx, " when adding ", matcher).AtDebug().WriteToLog()
+-					matcherInfos = append(matcherInfos, make([]DomainMatcherInfo, midx-uint32(len(matcherInfos))+1)...)
+-				}
+-				info := &matcherInfos[midx]
+-				info.clientIdx = uint16(idx)
+-				if ruleCurr < len(ns.OriginalRules) {
+-					info.domainRuleIdx = uint16(ruleCurr)
+-					rule := ns.OriginalRules[ruleCurr]
+-					if ruleCurr >= len(rules) {
+-						rules = append(rules, rule.Rule)
+-					}
+-					ruleIter++
+-					if ruleIter >= int(rule.Size) {
+-						ruleIter = 0
+-						ruleCurr++
+-					}
+-				} else { // No original rule, generate one according to current domain matcher (majorly for compatibility with tests)
+-					info.domainRuleIdx = uint16(len(rules))
+-					rules = append(rules, matcher.String())
+-				}
+-			}
+-			domainRules[idx] = rules
+-
+-			// only add to ipIndexMap if GeoIP is configured
+-			if len(ns.Geoip) > 0 {
+-				var matchers []*router.GeoIPMatcher
+-				for _, geoip := range ns.Geoip {
+-					matcher, err := geoIPMatcherContainer.Add(geoip)
+-					if err != nil {
+-						return nil, newError("failed to create ip matcher").Base(err).AtWarning()
+-					}
+-					matchers = append(matchers, matcher)
+-				}
+-				matcher := &MultiGeoIPMatcher{matchers: matchers}
+-				server.ipIndexMap[idx] = matcher
+-			}
+-		}
+-		server.domainRules = domainRules
+-		server.domainMatcher = domainMatcher
+-		server.matcherInfos = matcherInfos
+-	}
+-
+-	if len(server.clients) == 0 {
+-		server.clients = append(server.clients, NewLocalNameServer())
+-		server.ipIndexMap = append(server.ipIndexMap, nil)
+-	}
+-
+-	return server, nil
+-}
+-
+-// Type implements common.HasType.
+-func (*Server) Type() interface{} {
+-	return dns.ClientType()
+-}
+-
+-// Start implements common.Runnable.
+-func (s *Server) Start() error {
+-	return nil
+-}
+-
+-// Close implements common.Closable.
+-func (s *Server) Close() error {
+-	return nil
+-}
+-
+-func (s *Server) IsOwnLink(ctx context.Context) bool {
+-	inbound := session.InboundFromContext(ctx)
+-	return inbound != nil && inbound.Tag == s.tag
+-}
+-
+-// Match check dns ip match geoip
+-func (s *Server) Match(idx int, client Client, domain string, ips []net.IP) ([]net.IP, error) {
+-	var matcher *MultiGeoIPMatcher
+-	if idx < len(s.ipIndexMap) {
+-		matcher = s.ipIndexMap[idx]
+-	}
+-	if matcher == nil {
+-		return ips, nil
+-	}
+-
+-	if !matcher.HasMatcher() {
+-		newError("domain ", domain, " server has no valid matcher: ", client.Name(), " idx:", idx).AtDebug().WriteToLog()
+-		return ips, nil
+-	}
+-
+-	newIps := []net.IP{}
+-	for _, ip := range ips {
+-		if matcher.Match(ip) {
+-			newIps = append(newIps, ip)
+-		}
+-	}
+-	if len(newIps) == 0 {
+-		return nil, errExpectedIPNonMatch
+-	}
+-	newError("domain ", domain, " expectIPs ", newIps, " matched at server ", client.Name(), " idx:", idx).AtDebug().WriteToLog()
+-	return newIps, nil
+-}
+-
+-func (s *Server) queryIPTimeout(idx int, client Client, domain string, option dns.IPOption) ([]net.IP, error) {
+-	ctx, cancel := context.WithTimeout(s.ctx, time.Second*4)
+-	if len(s.tag) > 0 {
+-		ctx = session.ContextWithInbound(ctx, &session.Inbound{
+-			Tag: s.tag,
+-		})
+-	}
+-	ctx = internet.ContextWithLookupDomain(ctx, domain)
+-	ips, err := client.QueryIP(ctx, domain, option)
+-	cancel()
+-
+-	if err != nil {
+-		return ips, err
+-	}
+-
+-	ips, err = s.Match(idx, client, domain, ips)
+-	return ips, err
+-}
+-
+-func (s *Server) lookupStatic(domain string, option dns.IPOption, depth int32) []net.Address {
+-	ips := s.hosts.LookupIP(domain, option)
+-	if ips == nil {
+-		return nil
+-	}
+-	if ips[0].Family().IsDomain() && depth < 5 {
+-		if newIPs := s.lookupStatic(ips[0].Domain(), option, depth+1); newIPs != nil {
+-			return newIPs
+-		}
+-	}
+-	return ips
+-}
+-
+-func toNetIP(ips []net.Address) []net.IP {
+-	if len(ips) == 0 {
+-		return nil
+-	}
+-	netips := make([]net.IP, 0, len(ips))
+-	for _, ip := range ips {
+-		netips = append(netips, ip.IP())
+-	}
+-	return netips
+-}
+-
+-// LookupIP implements dns.Client.
+-func (s *Server) LookupIP(domain string, option dns.IPOption) ([]net.IP, error) {
+-	if domain == "" {
+-		return nil, newError("empty domain name")
+-	}
+-	domain = strings.ToLower(domain)
+-
+-	// normalize the FQDN form query
+-	if strings.HasSuffix(domain, ".") {
+-		domain = domain[:len(domain)-1]
+-	}
+-
+-	ips := s.lookupStatic(domain, option, 0)
+-	if ips != nil && ips[0].Family().IsIP() {
+-		newError("returning ", len(ips), " IPs for domain ", domain).WriteToLog()
+-		return toNetIP(ips), nil
+-	}
+-
+-	if ips != nil && ips[0].Family().IsDomain() {
+-		newdomain := ips[0].Domain()
+-		newError("domain replaced: ", domain, " -> ", newdomain).WriteToLog()
+-		domain = newdomain
+-	}
+-
+-	var lastErr error
+-	var matchedClient Client
+-	if s.domainMatcher != nil {
+-		indices := s.domainMatcher.Match(domain)
+-		domainRules := []string{}
+-		matchingDNS := []string{}
+-		for _, idx := range indices {
+-			info := s.matcherInfos[idx]
+-			rule := s.domainRules[info.clientIdx][info.domainRuleIdx]
+-			domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", rule, info.clientIdx))
+-			matchingDNS = append(matchingDNS, s.clients[info.clientIdx].Name())
+-		}
+-		if len(domainRules) > 0 {
+-			newError("domain ", domain, " matches following rules: ", domainRules).AtDebug().WriteToLog()
+-		}
+-		if len(matchingDNS) > 0 {
+-			newError("domain ", domain, " uses following DNS first: ", matchingDNS).AtDebug().WriteToLog()
+-		}
+-		for _, idx := range indices {
+-			clientIdx := int(s.matcherInfos[idx].clientIdx)
+-			matchedClient = s.clients[clientIdx]
+-			if !option.FakeEnable && strings.EqualFold(matchedClient.Name(), "FakeDNS") {
+-				newError("skip DNS resolution for domain ", domain, " at server ", matchedClient.Name()).AtDebug().WriteToLog()
+-				continue
+-			}
+-			ips, err := s.queryIPTimeout(clientIdx, matchedClient, domain, option)
+-			if len(ips) > 0 {
+-				return ips, nil
+-			}
+-			if err == dns.ErrEmptyResponse {
+-				return nil, err
+-			}
+-			if err != nil {
+-				newError("failed to lookup ip for domain ", domain, " at server ", matchedClient.Name()).Base(err).WriteToLog()
+-				lastErr = err
+-			}
+-		}
+-	}
+-
+-	for idx, client := range s.clients {
+-		if client == matchedClient {
+-			newError("domain ", domain, " at server ", client.Name(), " idx:", idx, " already lookup failed, just ignore").AtDebug().WriteToLog()
+-			continue
+-		}
+-		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
+-			newError("skip DNS resolution for domain ", domain, " at server ", client.Name()).AtDebug().WriteToLog()
+-			continue
+-		}
+-		ips, err := s.queryIPTimeout(idx, client, domain, option)
+-		if len(ips) > 0 {
+-			return ips, nil
+-		}
+-
+-		if err != nil {
+-			newError("failed to lookup ip for domain ", domain, " at server ", client.Name()).Base(err).WriteToLog()
+-			lastErr = err
+-		}
+-		if err != context.Canceled && err != context.DeadlineExceeded && err != errExpectedIPNonMatch {
+-			return nil, err
+-		}
+-	}
+-
+-	return nil, newError("returning nil for domain ", domain).Base(lastErr)
+-}
+-
+-func init() {
+-	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+-		return New(ctx, config.(*Config))
+-	}))
+-}
+diff --git a/app/router/command/config.go b/app/router/command/config.go
+index e95418d..7b62e71 100644
+--- a/app/router/command/config.go
++++ b/app/router/command/config.go
+@@ -28,6 +28,12 @@ func (c routingContext) GetTargetPort() net.Port {
+ 	return net.Port(c.RoutingContext.GetTargetPort())
+ }
+ 
++// GetSkipDNSResolve is a mock implementation here to match the interface,
++// SkipDNSResolve is set from dns module, no use if coming from a protobuf object?
++func (c routingContext) GetSkipDNSResolve() bool {
++	return false
++}
++
+ // AsRoutingContext converts a protobuf RoutingContext into an implementation of routing.Context.
+ func AsRoutingContext(r *RoutingContext) routing.Context {
+ 	return routingContext{r}
+diff --git a/app/router/router.go b/app/router/router.go
+index 5d2bdc3..8c8b32e 100644
+--- a/app/router/router.go
++++ b/app/router/router.go
+@@ -80,7 +80,13 @@ func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
+ }
+ 
+ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context, error) {
+-	if r.domainStrategy == Config_IpOnDemand {
++
++	// SkipDNSResolve is set from DNS module.
++	// the DOH remote server maybe a domain name,
++	// this prevents cycle resolving dead loop
++	skipDNSResolve := ctx.GetSkipDNSResolve()
++
++	if r.domainStrategy == Config_IpOnDemand && !skipDNSResolve {
+ 		ctx = routing_dns.ContextWithDNSClient(ctx, r.dns)
+ 	}
+ 
+@@ -90,7 +96,7 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
+ 		}
+ 	}
+ 
+-	if r.domainStrategy != Config_IpIfNonMatch || len(ctx.GetTargetDomain()) == 0 {
++	if r.domainStrategy != Config_IpIfNonMatch || len(ctx.GetTargetDomain()) == 0 || skipDNSResolve {
+ 		return nil, ctx, common.ErrNoClue
+ 	}
+ 
+diff --git a/common/session/session.go b/common/session/session.go
+index 4744ade..24ac463 100644
+--- a/common/session/session.go
++++ b/common/session/session.go
+@@ -75,7 +75,7 @@ type Content struct {
+ 
+ 	Attributes map[string]string
+ 
+-	SkipRoutePick bool
++	SkipDNSResolve bool
+ }
+ 
+ // Sockopt is the settings for socket connection.
+diff --git a/features/routing/context.go b/features/routing/context.go
+index f5a732a..e7867c3 100644
+--- a/features/routing/context.go
++++ b/features/routing/context.go
+@@ -37,4 +37,7 @@ type Context interface {
+ 
+ 	// GetAttributes returns extra attributes from the conneciont content.
+ 	GetAttributes() map[string]string
++
++	// GetSkipDNSResolve returns a flag switch for weather skip dns resolve during route pick.
++	GetSkipDNSResolve() bool
+ }
+diff --git a/features/routing/session/context.go b/features/routing/session/context.go
+index 0b37ebf..ce7e949 100644
+--- a/features/routing/session/context.go
++++ b/features/routing/session/context.go
+@@ -109,6 +109,14 @@ func (ctx *Context) GetAttributes() map[string]string {
+ 	return ctx.Content.Attributes
+ }
+ 
++// GetSkipDNSResolve implements routing.Context.
++func (ctx *Context) GetSkipDNSResolve() bool {
++	if ctx.Content == nil {
++		return false
++	}
++	return ctx.Content.SkipDNSResolve
++}
++
+ // AsRoutingContext creates a context from context.context with session info.
+ func AsRoutingContext(ctx context.Context) routing.Context {
+ 	return &Context{
+diff --git a/infra/conf/dns.go b/infra/conf/dns.go
+index ea86359..7e0bd41 100644
+--- a/infra/conf/dns.go
++++ b/infra/conf/dns.go
+@@ -108,10 +108,11 @@ var typeMap = map[router.Domain_Type]dns.DomainMatchingType{
+ 
+ // DNSConfig is a JSON serializable object for dns.Config.
+ type DNSConfig struct {
+-	Servers  []*NameServerConfig `json:"servers"`
+-	Hosts    map[string]*Address `json:"hosts"`
+-	ClientIP *Address            `json:"clientIp"`
+-	Tag      string              `json:"tag"`
++	Servers      []*NameServerConfig `json:"servers"`
++	Hosts        map[string]*Address `json:"hosts"`
++	ClientIP     *Address            `json:"clientIp"`
++	Tag          string              `json:"tag"`
++	DisableCache bool                `json:"disableCache"`
+ }
+ 
+ func getHostMapping(addr *Address) *dns.Config_HostMapping {
+@@ -129,7 +130,8 @@ func getHostMapping(addr *Address) *dns.Config_HostMapping {
+ // Build implements Buildable
+ func (c *DNSConfig) Build() (*dns.Config, error) {
+ 	config := &dns.Config{
+-		Tag: c.Tag,
++		Tag:          c.Tag,
++		DisableCache: c.DisableCache,
+ 	}
+ 
+ 	if c.ClientIP != nil {
+-- 
+2.20.1
+

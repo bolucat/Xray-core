@@ -1,0 +1,38 @@
+From b977899926da99484ca6b891dc36ec799a7b1d9f Mon Sep 17 00:00:00 2001
+From: hmol233 <82594500+hmol233@users.noreply.github.com>
+Date: Mon, 14 Jun 2021 20:40:17 +0800
+Subject: [PATCH] Check buffer before releasing
+
+to avoid `extending out of bound` issue in some cases
+---
+ common/buf/buffer.go | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/common/buf/buffer.go b/common/buf/buffer.go
+index 9eef999..7c8f965 100644
+--- a/common/buf/buffer.go
++++ b/common/buf/buffer.go
+@@ -27,7 +27,7 @@ type Buffer struct {
+ // New creates a Buffer with 0 length and 2K capacity.
+ func New() *Buffer {
+ 	return &Buffer{
+-		v: pool.Get().([]byte),
++		v: buf,
+ 	}
+ }
+ 
+@@ -64,7 +64,10 @@ func (b *Buffer) Release() {
+ 	p := b.v
+ 	b.v = nil
+ 	b.Clear()
+-	pool.Put(p)
++
++	if cap(p) >= Size {
++		pool.Put(p)
++	}
+ 	b.UDP = nil
+ }
+ 
+-- 
+2.20.1
+

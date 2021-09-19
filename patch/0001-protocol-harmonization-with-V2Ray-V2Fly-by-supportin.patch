@@ -1,0 +1,26 @@
+From 099c6453320dacfb8c439deea75664c034929537 Mon Sep 17 00:00:00 2001
+From: Shelikhoo <xiaokangwang@outlook.com>
+Date: Thu, 6 May 2021 14:35:40 +0100
+Subject: [PATCH] protocol harmonization with V2Ray/V2Fly by supporting both
+ V2Ray server and XRay server
+
+---
+ transport/internet/websocket/dialer.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/transport/internet/websocket/dialer.go b/transport/internet/websocket/dialer.go
+index 3dc56cc..dc91be5 100644
+--- a/transport/internet/websocket/dialer.go
++++ b/transport/internet/websocket/dialer.go
+@@ -117,7 +117,7 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
+ 
+ 	header := wsSettings.GetRequestHeader()
+ 	if ed != nil {
+-		header.Set("Sec-WebSocket-Protocol", base64.StdEncoding.EncodeToString(ed))
++		header.Set("Sec-WebSocket-Protocol", base64.RawURLEncoding.EncodeToString(ed))
+ 	}
+ 
+ 	conn, resp, err := dialer.Dial(uri, header)
+-- 
+2.20.1
+

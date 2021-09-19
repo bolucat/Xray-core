@@ -1,0 +1,3498 @@
+From 26d3caf14f5d1299088e199a461e4005266fd2d8 Mon Sep 17 00:00:00 2001
+From: tat5522 <81008809+tat5522@users.noreply.github.com>
+Date: Sat, 20 Mar 2021 20:46:34 +0800
+Subject: [PATCH] Add the routing management gRPC API
+
+---
+ app/router/command/command.go         | 103 ++-
+ app/router/command/command.pb.go      | 973 +++++++++++++++++++++++---
+ app/router/command/command.proto      |  45 +-
+ app/router/command/command_grpc.pb.go | 245 ++++++-
+ app/router/command/command_test.go    | 584 +++++++++++++++-
+ app/router/command/config.go          |   1 +
+ app/router/config.go                  |  42 +-
+ app/router/config.pb.go               | 189 ++---
+ app/router/config.proto               |   3 +-
+ app/router/router.go                  | 127 +++-
+ app/router/router_test.go             | 149 +++-
+ features/routing/context.go           |   3 +
+ features/routing/router.go            |  52 ++
+ features/routing/session/context.go   |   4 +
+ infra/conf/api.go                     |   3 +
+ infra/conf/router.go                  |  17 +-
+ infra/conf/router_test.go             |  32 +-
+ infra/conf/xray_test.go               |   4 +-
+ testing/scenarios/command_test.go     |  12 +-
+ testing/scenarios/dns_test.go         |   4 +-
+ testing/scenarios/feature_test.go     |  12 +-
+ testing/scenarios/reverse_test.go     |  32 +-
+ testing/scenarios/socks_test.go       |   4 +-
+ 23 files changed, 2347 insertions(+), 293 deletions(-)
+
+diff --git a/app/router/command/command.go b/app/router/command/command.go
+index fff78cb..1b7fc9b 100644
+--- a/app/router/command/command.go
++++ b/app/router/command/command.go
+@@ -4,6 +4,7 @@ package command
+ 
+ import (
+ 	"context"
++	"github.com/xtls/xray-core/features/outbound"
+ 	"time"
+ 
+ 	"google.golang.org/grpc"
+@@ -16,6 +17,8 @@ import (
+ 
+ // routingServer is an implementation of RoutingService.
+ type routingServer struct {
++	s            *core.Instance
++	ohm          outbound.Manager
+ 	router       routing.Router
+ 	routingStats stats.Channel
+ }
+@@ -43,6 +46,82 @@ func (s *routingServer) TestRoute(ctx context.Context, request *TestRouteRequest
+ 	return AsProtobufMessage(request.FieldSelectors)(route), nil
+ }
+ 
++func (s *routingServer) AddRoutingRule(ctx context.Context, request *AddRoutingRuleRequest) (*AddRoutingRuleResponse, error) {
++	if request.RoutingRule == nil {
++		return nil, newError("Invalid RoutingRule request.")
++	}
++	err := s.router.AddRoutingRule(ctx, request.RoutingRule)
++	if err != nil {
++		return nil, err
++	}
++	return &AddRoutingRuleResponse{}, nil
++}
++
++func (s *routingServer) AlterRoutingRule(ctx context.Context, request *AlterRoutingRuleRequest) (*AlterRoutingRuleResponse, error) {
++	if request.RoutingRule == nil {
++		return nil, newError("Invalid RoutingRule request.")
++	}
++
++	if len(request.Tag) == 0 {
++		return nil, newError("Invalid Tag.")
++	}
++
++	err := s.router.AlterRoutingRule(ctx, request.Tag, request.RoutingRule)
++	if err != nil {
++		return nil, err
++	}
++	return &AlterRoutingRuleResponse{}, nil
++}
++
++func (s *routingServer) RemoveRoutingRule(ctx context.Context, request *RemoveRoutingRuleRequest) (*RemoveRoutingRuleResponse, error) {
++	if len(request.Tag) == 0 {
++		return nil, newError("Invalid Tag.")
++	}
++	err := s.router.RemoveRoutingRule(ctx, request.Tag)
++	if err != nil {
++		return nil, err
++	}
++	return &RemoveRoutingRuleResponse{}, nil
++}
++
++func (s *routingServer) AddBalancingRule(ctx context.Context, request *AddBalancingRuleRequest) (*AddBalancingRuleResponse, error) {
++	if request.Balancing == nil {
++		return nil, newError("Invalid Balancing request.")
++	}
++
++	err := s.router.AddBalancingRule(ctx, request.Balancing, s.ohm)
++	if err != nil {
++		return nil, err
++	}
++	return &AddBalancingRuleResponse{}, nil
++}
++
++func (s *routingServer) AlterBalancingRule(ctx context.Context, request *AlterBalancingRuleRequest) (*AlterBalancingRuleResponse, error) {
++	if request.Balancing == nil {
++		return nil, newError("Invalid Balancing request.")
++	}
++
++	if len(request.Tag) == 0 {
++		return nil, newError("Invalid Tag.")
++	}
++	err := s.router.AlterBalancingRule(ctx, request.Tag, request.Balancing, s.ohm)
++	if err != nil {
++		return nil, err
++	}
++	return &AlterBalancingRuleResponse{}, nil
++}
++
++func (s *routingServer) RemoveBalancingRule(ctx context.Context, request *RemoveBalancingRuleRequest) (*RemoveBalancingRuleResponse, error) {
++	if len(request.Tag) == 0 {
++		return nil, newError("Invalid Tag.")
++	}
++	err := s.router.RemoveBalancingRule(ctx, request.Tag)
++	if err != nil {
++		return nil, err
++	}
++	return &RemoveBalancingRuleResponse{}, nil
++}
++
+ func (s *routingServer) SubscribeRoutingStats(request *SubscribeRoutingStatsRequest, stream RoutingService_SubscribeRoutingStatsServer) error {
+ 	if s.routingStats == nil {
+ 		return newError("Routing statistics not enabled.")
+@@ -80,15 +159,23 @@ type service struct {
+ }
+ 
+ func (s *service) Register(server *grpc.Server) {
+-	common.Must(s.v.RequireFeatures(func(router routing.Router, stats stats.Manager) {
+-		rs := NewRoutingServer(router, nil)
+-		RegisterRoutingServiceServer(server, rs)
+-
+-		// For compatibility purposes
+-		vCoreDesc := RoutingService_ServiceDesc
+-		vCoreDesc.ServiceName = "v2ray.core.app.router.command.RoutingService"
+-		server.RegisterService(&vCoreDesc, rs)
++	rs := &routingServer{
++		s:            s.v,
++		ohm:          nil,
++		router:       nil,
++		routingStats: nil,
++	}
++
++	common.Must(s.v.RequireFeatures(func(router routing.Router, stats stats.Manager, om outbound.Manager) {
++		rs.ohm = om
++		rs.router = router
+ 	}))
++
++	RegisterRoutingServiceServer(server, rs)
++	// For compatibility purposes
++	vCoreDesc := RoutingService_ServiceDesc
++	vCoreDesc.ServiceName = "v2ray.core.app.router.command.RoutingService"
++	server.RegisterService(&vCoreDesc, rs)
+ }
+ 
+ func init() {
+diff --git a/app/router/command/command.pb.go b/app/router/command/command.pb.go
+index 2017669..ff8eaf9 100644
+--- a/app/router/command/command.pb.go
++++ b/app/router/command/command.pb.go
+@@ -1,13 +1,13 @@
+ // Code generated by protoc-gen-go. DO NOT EDIT.
+ // versions:
+-// 	protoc-gen-go v1.25.0
+-// 	protoc        v3.14.0
++// 	protoc-gen-go v1.26.0
++// 	protoc        v3.15.6
+ // source: app/router/command/command.proto
+ 
+ package command
+ 
+ import (
+-	proto "github.com/golang/protobuf/proto"
++	router "github.com/xtls/xray-core/app/router"
+ 	net "github.com/xtls/xray-core/common/net"
+ 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+ 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+@@ -22,10 +22,6 @@ const (
+ 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+ )
+ 
+-// This is a compile-time assertion that a sufficiently up-to-date version
+-// of the legacy proto package is being used.
+-const _ = proto.ProtoPackageIsVersion4
+-
+ // RoutingContext is the context with information relative to routing process.
+ // It conforms to the structure of xray.features.routing.Context and
+ // xray.features.routing.Route.
+@@ -46,6 +42,7 @@ type RoutingContext struct {
+ 	Attributes        map[string]string `protobuf:"bytes,10,rep,name=Attributes,proto3" json:"Attributes,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+ 	OutboundGroupTags []string          `protobuf:"bytes,11,rep,name=OutboundGroupTags,proto3" json:"OutboundGroupTags,omitempty"`
+ 	OutboundTag       string            `protobuf:"bytes,12,opt,name=OutboundTag,proto3" json:"OutboundTag,omitempty"`
++	Tag               string            `protobuf:"bytes,13,opt,name=Tag,proto3" json:"Tag,omitempty"`
+ }
+ 
+ func (x *RoutingContext) Reset() {
+@@ -164,6 +161,13 @@ func (x *RoutingContext) GetOutboundTag() string {
+ 	return ""
+ }
+ 
++func (x *RoutingContext) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
+ // SubscribeRoutingStatsRequest subscribes to routing statistics channel if
+ // opened by xray-core.
+ // * FieldSelectors selects a subset of fields in routing statistics to return.
+@@ -298,6 +302,532 @@ func (x *TestRouteRequest) GetPublishResult() bool {
+ 	return false
+ }
+ 
++type AddRoutingRuleRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	RoutingRule *router.RoutingRule `protobuf:"bytes,1,opt,name=routingRule,proto3" json:"routingRule,omitempty"`
++}
++
++func (x *AddRoutingRuleRequest) Reset() {
++	*x = AddRoutingRuleRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[3]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AddRoutingRuleRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AddRoutingRuleRequest) ProtoMessage() {}
++
++func (x *AddRoutingRuleRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[3]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AddRoutingRuleRequest.ProtoReflect.Descriptor instead.
++func (*AddRoutingRuleRequest) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{3}
++}
++
++func (x *AddRoutingRuleRequest) GetRoutingRule() *router.RoutingRule {
++	if x != nil {
++		return x.RoutingRule
++	}
++	return nil
++}
++
++type AddRoutingRuleResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *AddRoutingRuleResponse) Reset() {
++	*x = AddRoutingRuleResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[4]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AddRoutingRuleResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AddRoutingRuleResponse) ProtoMessage() {}
++
++func (x *AddRoutingRuleResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[4]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AddRoutingRuleResponse.ProtoReflect.Descriptor instead.
++func (*AddRoutingRuleResponse) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{4}
++}
++
++type AlterRoutingRuleRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Tag         string              `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
++	RoutingRule *router.RoutingRule `protobuf:"bytes,2,opt,name=routingRule,proto3" json:"routingRule,omitempty"`
++}
++
++func (x *AlterRoutingRuleRequest) Reset() {
++	*x = AlterRoutingRuleRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[5]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AlterRoutingRuleRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AlterRoutingRuleRequest) ProtoMessage() {}
++
++func (x *AlterRoutingRuleRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[5]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AlterRoutingRuleRequest.ProtoReflect.Descriptor instead.
++func (*AlterRoutingRuleRequest) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{5}
++}
++
++func (x *AlterRoutingRuleRequest) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
++func (x *AlterRoutingRuleRequest) GetRoutingRule() *router.RoutingRule {
++	if x != nil {
++		return x.RoutingRule
++	}
++	return nil
++}
++
++type AlterRoutingRuleResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *AlterRoutingRuleResponse) Reset() {
++	*x = AlterRoutingRuleResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[6]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AlterRoutingRuleResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AlterRoutingRuleResponse) ProtoMessage() {}
++
++func (x *AlterRoutingRuleResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[6]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AlterRoutingRuleResponse.ProtoReflect.Descriptor instead.
++func (*AlterRoutingRuleResponse) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{6}
++}
++
++type RemoveRoutingRuleRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Tag string `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
++}
++
++func (x *RemoveRoutingRuleRequest) Reset() {
++	*x = RemoveRoutingRuleRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[7]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RemoveRoutingRuleRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RemoveRoutingRuleRequest) ProtoMessage() {}
++
++func (x *RemoveRoutingRuleRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[7]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RemoveRoutingRuleRequest.ProtoReflect.Descriptor instead.
++func (*RemoveRoutingRuleRequest) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{7}
++}
++
++func (x *RemoveRoutingRuleRequest) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
++type RemoveRoutingRuleResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *RemoveRoutingRuleResponse) Reset() {
++	*x = RemoveRoutingRuleResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[8]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RemoveRoutingRuleResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RemoveRoutingRuleResponse) ProtoMessage() {}
++
++func (x *RemoveRoutingRuleResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[8]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RemoveRoutingRuleResponse.ProtoReflect.Descriptor instead.
++func (*RemoveRoutingRuleResponse) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{8}
++}
++
++type AddBalancingRuleRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Balancing *router.BalancingRule `protobuf:"bytes,1,opt,name=balancing,proto3" json:"balancing,omitempty"`
++}
++
++func (x *AddBalancingRuleRequest) Reset() {
++	*x = AddBalancingRuleRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[9]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AddBalancingRuleRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AddBalancingRuleRequest) ProtoMessage() {}
++
++func (x *AddBalancingRuleRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[9]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AddBalancingRuleRequest.ProtoReflect.Descriptor instead.
++func (*AddBalancingRuleRequest) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{9}
++}
++
++func (x *AddBalancingRuleRequest) GetBalancing() *router.BalancingRule {
++	if x != nil {
++		return x.Balancing
++	}
++	return nil
++}
++
++type AddBalancingRuleResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *AddBalancingRuleResponse) Reset() {
++	*x = AddBalancingRuleResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[10]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AddBalancingRuleResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AddBalancingRuleResponse) ProtoMessage() {}
++
++func (x *AddBalancingRuleResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[10]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AddBalancingRuleResponse.ProtoReflect.Descriptor instead.
++func (*AddBalancingRuleResponse) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{10}
++}
++
++type AlterBalancingRuleRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Tag       string                `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
++	Balancing *router.BalancingRule `protobuf:"bytes,2,opt,name=balancing,proto3" json:"balancing,omitempty"`
++}
++
++func (x *AlterBalancingRuleRequest) Reset() {
++	*x = AlterBalancingRuleRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[11]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AlterBalancingRuleRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AlterBalancingRuleRequest) ProtoMessage() {}
++
++func (x *AlterBalancingRuleRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[11]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AlterBalancingRuleRequest.ProtoReflect.Descriptor instead.
++func (*AlterBalancingRuleRequest) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{11}
++}
++
++func (x *AlterBalancingRuleRequest) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
++func (x *AlterBalancingRuleRequest) GetBalancing() *router.BalancingRule {
++	if x != nil {
++		return x.Balancing
++	}
++	return nil
++}
++
++type AlterBalancingRuleResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *AlterBalancingRuleResponse) Reset() {
++	*x = AlterBalancingRuleResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[12]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AlterBalancingRuleResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AlterBalancingRuleResponse) ProtoMessage() {}
++
++func (x *AlterBalancingRuleResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[12]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AlterBalancingRuleResponse.ProtoReflect.Descriptor instead.
++func (*AlterBalancingRuleResponse) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{12}
++}
++
++type RemoveBalancingRuleRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Tag string `protobuf:"bytes,1,opt,name=tag,proto3" json:"tag,omitempty"`
++}
++
++func (x *RemoveBalancingRuleRequest) Reset() {
++	*x = RemoveBalancingRuleRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[13]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RemoveBalancingRuleRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RemoveBalancingRuleRequest) ProtoMessage() {}
++
++func (x *RemoveBalancingRuleRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[13]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RemoveBalancingRuleRequest.ProtoReflect.Descriptor instead.
++func (*RemoveBalancingRuleRequest) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{13}
++}
++
++func (x *RemoveBalancingRuleRequest) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
++type RemoveBalancingRuleResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *RemoveBalancingRuleResponse) Reset() {
++	*x = RemoveBalancingRuleResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_app_router_command_command_proto_msgTypes[14]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RemoveBalancingRuleResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RemoveBalancingRuleResponse) ProtoMessage() {}
++
++func (x *RemoveBalancingRuleResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_app_router_command_command_proto_msgTypes[14]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RemoveBalancingRuleResponse.ProtoReflect.Descriptor instead.
++func (*RemoveBalancingRuleResponse) Descriptor() ([]byte, []int) {
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{14}
++}
++
+ type Config struct {
+ 	state         protoimpl.MessageState
+ 	sizeCache     protoimpl.SizeCache
+@@ -307,7 +837,7 @@ type Config struct {
+ func (x *Config) Reset() {
+ 	*x = Config{}
+ 	if protoimpl.UnsafeEnabled {
+-		mi := &file_app_router_command_command_proto_msgTypes[3]
++		mi := &file_app_router_command_command_proto_msgTypes[15]
+ 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+ 		ms.StoreMessageInfo(mi)
+ 	}
+@@ -320,7 +850,7 @@ func (x *Config) String() string {
+ func (*Config) ProtoMessage() {}
+ 
+ func (x *Config) ProtoReflect() protoreflect.Message {
+-	mi := &file_app_router_command_command_proto_msgTypes[3]
++	mi := &file_app_router_command_command_proto_msgTypes[15]
+ 	if protoimpl.UnsafeEnabled && x != nil {
+ 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+ 		if ms.LoadMessageInfo() == nil {
+@@ -333,7 +863,7 @@ func (x *Config) ProtoReflect() protoreflect.Message {
+ 
+ // Deprecated: Use Config.ProtoReflect.Descriptor instead.
+ func (*Config) Descriptor() ([]byte, []int) {
+-	return file_app_router_command_command_proto_rawDescGZIP(), []int{3}
++	return file_app_router_command_command_proto_rawDescGZIP(), []int{15}
+ }
+ 
+ var File_app_router_command_command_proto protoreflect.FileDescriptor
+@@ -344,72 +874,163 @@ var file_app_router_command_command_proto_rawDesc = []byte{
+ 	0x74, 0x6f, 0x12, 0x17, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75,
+ 	0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x1a, 0x18, 0x63, 0x6f, 0x6d,
+ 	0x6d, 0x6f, 0x6e, 0x2f, 0x6e, 0x65, 0x74, 0x2f, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x2e,
+-	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x22, 0x9c, 0x04, 0x0a, 0x0e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e,
+-	0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x12, 0x1e, 0x0a, 0x0a, 0x49, 0x6e, 0x62, 0x6f,
+-	0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x49, 0x6e,
+-	0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x12, 0x32, 0x0a, 0x07, 0x4e, 0x65, 0x74, 0x77,
+-	0x6f, 0x72, 0x6b, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x18, 0x2e, 0x78, 0x72, 0x61, 0x79,
+-	0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x4e, 0x65, 0x74, 0x77,
+-	0x6f, 0x72, 0x6b, 0x52, 0x07, 0x4e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x12, 0x1c, 0x0a, 0x09,
+-	0x53, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x49, 0x50, 0x73, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0c, 0x52,
+-	0x09, 0x53, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x49, 0x50, 0x73, 0x12, 0x1c, 0x0a, 0x09, 0x54, 0x61,
+-	0x72, 0x67, 0x65, 0x74, 0x49, 0x50, 0x73, 0x18, 0x04, 0x20, 0x03, 0x28, 0x0c, 0x52, 0x09, 0x54,
+-	0x61, 0x72, 0x67, 0x65, 0x74, 0x49, 0x50, 0x73, 0x12, 0x1e, 0x0a, 0x0a, 0x53, 0x6f, 0x75, 0x72,
+-	0x63, 0x65, 0x50, 0x6f, 0x72, 0x74, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x0a, 0x53, 0x6f,
+-	0x75, 0x72, 0x63, 0x65, 0x50, 0x6f, 0x72, 0x74, 0x12, 0x1e, 0x0a, 0x0a, 0x54, 0x61, 0x72, 0x67,
+-	0x65, 0x74, 0x50, 0x6f, 0x72, 0x74, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x0a, 0x54, 0x61,
+-	0x72, 0x67, 0x65, 0x74, 0x50, 0x6f, 0x72, 0x74, 0x12, 0x22, 0x0a, 0x0c, 0x54, 0x61, 0x72, 0x67,
+-	0x65, 0x74, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x18, 0x07, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c,
+-	0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x12, 0x1a, 0x0a, 0x08,
+-	0x50, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f, 0x6c, 0x18, 0x08, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08,
+-	0x50, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f, 0x6c, 0x12, 0x12, 0x0a, 0x04, 0x55, 0x73, 0x65, 0x72,
+-	0x18, 0x09, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x55, 0x73, 0x65, 0x72, 0x12, 0x57, 0x0a, 0x0a,
+-	0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x73, 0x18, 0x0a, 0x20, 0x03, 0x28, 0x0b,
+-	0x32, 0x37, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
+-	0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52, 0x6f, 0x75, 0x74, 0x69,
+-	0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x2e, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62,
+-	0x75, 0x74, 0x65, 0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x0a, 0x41, 0x74, 0x74, 0x72, 0x69,
+-	0x62, 0x75, 0x74, 0x65, 0x73, 0x12, 0x2c, 0x0a, 0x11, 0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e,
+-	0x64, 0x47, 0x72, 0x6f, 0x75, 0x70, 0x54, 0x61, 0x67, 0x73, 0x18, 0x0b, 0x20, 0x03, 0x28, 0x09,
+-	0x52, 0x11, 0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x47, 0x72, 0x6f, 0x75, 0x70, 0x54,
+-	0x61, 0x67, 0x73, 0x12, 0x20, 0x0a, 0x0b, 0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54,
+-	0x61, 0x67, 0x18, 0x0c, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75,
+-	0x6e, 0x64, 0x54, 0x61, 0x67, 0x1a, 0x3d, 0x0a, 0x0f, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75,
+-	0x74, 0x65, 0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18,
+-	0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a, 0x05, 0x76, 0x61,
+-	0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65,
+-	0x3a, 0x02, 0x38, 0x01, 0x22, 0x46, 0x0a, 0x1c, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62,
+-	0x65, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x53, 0x74, 0x61, 0x74, 0x73, 0x52, 0x65, 0x71,
+-	0x75, 0x65, 0x73, 0x74, 0x12, 0x26, 0x0a, 0x0e, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x53, 0x65, 0x6c,
+-	0x65, 0x63, 0x74, 0x6f, 0x72, 0x73, 0x18, 0x01, 0x20, 0x03, 0x28, 0x09, 0x52, 0x0e, 0x46, 0x69,
+-	0x65, 0x6c, 0x64, 0x53, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x73, 0x22, 0xb1, 0x01, 0x0a,
+-	0x10, 0x54, 0x65, 0x73, 0x74, 0x52, 0x6f, 0x75, 0x74, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
+-	0x74, 0x12, 0x4f, 0x0a, 0x0e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74,
+-	0x65, 0x78, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x78, 0x72, 0x61, 0x79,
++	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x1a, 0x17, 0x61, 0x70, 0x70, 0x2f, 0x72, 0x6f, 0x75, 0x74, 0x65,
++	0x72, 0x2f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x22, 0xae,
++	0x04, 0x0a, 0x0e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78,
++	0x74, 0x12, 0x1e, 0x0a, 0x0a, 0x49, 0x6e, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x18,
++	0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x49, 0x6e, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54, 0x61,
++	0x67, 0x12, 0x32, 0x0a, 0x07, 0x4e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x18, 0x02, 0x20, 0x01,
++	0x28, 0x0e, 0x32, 0x18, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e,
++	0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x4e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x52, 0x07, 0x4e, 0x65,
++	0x74, 0x77, 0x6f, 0x72, 0x6b, 0x12, 0x1c, 0x0a, 0x09, 0x53, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x49,
++	0x50, 0x73, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0c, 0x52, 0x09, 0x53, 0x6f, 0x75, 0x72, 0x63, 0x65,
++	0x49, 0x50, 0x73, 0x12, 0x1c, 0x0a, 0x09, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x49, 0x50, 0x73,
++	0x18, 0x04, 0x20, 0x03, 0x28, 0x0c, 0x52, 0x09, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x49, 0x50,
++	0x73, 0x12, 0x1e, 0x0a, 0x0a, 0x53, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x50, 0x6f, 0x72, 0x74, 0x18,
++	0x05, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x0a, 0x53, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x50, 0x6f, 0x72,
++	0x74, 0x12, 0x1e, 0x0a, 0x0a, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x50, 0x6f, 0x72, 0x74, 0x18,
++	0x06, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x0a, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x50, 0x6f, 0x72,
++	0x74, 0x12, 0x22, 0x0a, 0x0c, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x44, 0x6f, 0x6d, 0x61, 0x69,
++	0x6e, 0x18, 0x07, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x54, 0x61, 0x72, 0x67, 0x65, 0x74, 0x44,
++	0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x12, 0x1a, 0x0a, 0x08, 0x50, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f,
++	0x6c, 0x18, 0x08, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x50, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f,
++	0x6c, 0x12, 0x12, 0x0a, 0x04, 0x55, 0x73, 0x65, 0x72, 0x18, 0x09, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x04, 0x55, 0x73, 0x65, 0x72, 0x12, 0x57, 0x0a, 0x0a, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75,
++	0x74, 0x65, 0x73, 0x18, 0x0a, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x37, 0x2e, 0x78, 0x72, 0x61, 0x79,
+ 	0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d,
+ 	0x61, 0x6e, 0x64, 0x2e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65,
+-	0x78, 0x74, 0x52, 0x0e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65,
+-	0x78, 0x74, 0x12, 0x26, 0x0a, 0x0e, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x53, 0x65, 0x6c, 0x65, 0x63,
+-	0x74, 0x6f, 0x72, 0x73, 0x18, 0x02, 0x20, 0x03, 0x28, 0x09, 0x52, 0x0e, 0x46, 0x69, 0x65, 0x6c,
+-	0x64, 0x53, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x73, 0x12, 0x24, 0x0a, 0x0d, 0x50, 0x75,
+-	0x62, 0x6c, 0x69, 0x73, 0x68, 0x52, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28,
+-	0x08, 0x52, 0x0d, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x73, 0x68, 0x52, 0x65, 0x73, 0x75, 0x6c, 0x74,
+-	0x22, 0x08, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x32, 0xf0, 0x01, 0x0a, 0x0e, 0x52,
+-	0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x7b, 0x0a,
+-	0x15, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e,
+-	0x67, 0x53, 0x74, 0x61, 0x74, 0x73, 0x12, 0x35, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70,
++	0x78, 0x74, 0x2e, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x73, 0x45, 0x6e, 0x74,
++	0x72, 0x79, 0x52, 0x0a, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x73, 0x12, 0x2c,
++	0x0a, 0x11, 0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x47, 0x72, 0x6f, 0x75, 0x70, 0x54,
++	0x61, 0x67, 0x73, 0x18, 0x0b, 0x20, 0x03, 0x28, 0x09, 0x52, 0x11, 0x4f, 0x75, 0x74, 0x62, 0x6f,
++	0x75, 0x6e, 0x64, 0x47, 0x72, 0x6f, 0x75, 0x70, 0x54, 0x61, 0x67, 0x73, 0x12, 0x20, 0x0a, 0x0b,
++	0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x18, 0x0c, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x0b, 0x4f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x12, 0x10,
++	0x0a, 0x03, 0x54, 0x61, 0x67, 0x18, 0x0d, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x54, 0x61, 0x67,
++	0x1a, 0x3d, 0x0a, 0x0f, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x73, 0x45, 0x6e,
++	0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02,
++	0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x22,
++	0x46, 0x0a, 0x1c, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x52, 0x6f, 0x75, 0x74,
++	0x69, 0x6e, 0x67, 0x53, 0x74, 0x61, 0x74, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12,
++	0x26, 0x0a, 0x0e, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x53, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x6f, 0x72,
++	0x73, 0x18, 0x01, 0x20, 0x03, 0x28, 0x09, 0x52, 0x0e, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x53, 0x65,
++	0x6c, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x73, 0x22, 0xb1, 0x01, 0x0a, 0x10, 0x54, 0x65, 0x73, 0x74,
++	0x52, 0x6f, 0x75, 0x74, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x4f, 0x0a, 0x0e,
++	0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x18, 0x01,
++	0x20, 0x01, 0x28, 0x0b, 0x32, 0x27, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e,
++	0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52,
++	0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x52, 0x0e, 0x52,
++	0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x12, 0x26, 0x0a,
++	0x0e, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x53, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x73, 0x18,
++	0x02, 0x20, 0x03, 0x28, 0x09, 0x52, 0x0e, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x53, 0x65, 0x6c, 0x65,
++	0x63, 0x74, 0x6f, 0x72, 0x73, 0x12, 0x24, 0x0a, 0x0d, 0x50, 0x75, 0x62, 0x6c, 0x69, 0x73, 0x68,
++	0x52, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x0d, 0x50, 0x75,
++	0x62, 0x6c, 0x69, 0x73, 0x68, 0x52, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x22, 0x57, 0x0a, 0x15, 0x41,
++	0x64, 0x64, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x12, 0x3e, 0x0a, 0x0b, 0x72, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52,
++	0x75, 0x6c, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1c, 0x2e, 0x78, 0x72, 0x61, 0x79,
++	0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x52, 0x6f, 0x75, 0x74,
++	0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x0b, 0x72, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67,
++	0x52, 0x75, 0x6c, 0x65, 0x22, 0x18, 0x0a, 0x16, 0x41, 0x64, 0x64, 0x52, 0x6f, 0x75, 0x74, 0x69,
++	0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x6b,
++	0x0a, 0x17, 0x41, 0x6c, 0x74, 0x65, 0x72, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75,
++	0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x74, 0x61, 0x67, 0x12, 0x3e, 0x0a, 0x0b, 0x72,
++	0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b,
++	0x32, 0x1c, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
++	0x65, 0x72, 0x2e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x0b,
++	0x72, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x22, 0x1a, 0x0a, 0x18, 0x41,
++	0x6c, 0x74, 0x65, 0x72, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52,
++	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x2c, 0x0a, 0x18, 0x52, 0x65, 0x6d, 0x6f, 0x76,
++	0x65, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71, 0x75,
++	0x65, 0x73, 0x74, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x03, 0x74, 0x61, 0x67, 0x22, 0x1b, 0x0a, 0x19, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x52,
++	0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x22, 0x57, 0x0a, 0x17, 0x41, 0x64, 0x64, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69,
++	0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x3c, 0x0a,
++	0x09, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b,
++	0x32, 0x1e, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
++	0x65, 0x72, 0x2e, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65,
++	0x52, 0x09, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x22, 0x1a, 0x0a, 0x18, 0x41,
++	0x64, 0x64, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52,
++	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x6b, 0x0a, 0x19, 0x41, 0x6c, 0x74, 0x65, 0x72,
++	0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x03, 0x74, 0x61, 0x67, 0x12, 0x3c, 0x0a, 0x09, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63,
++	0x69, 0x6e, 0x67, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x78, 0x72, 0x61, 0x79,
++	0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x42, 0x61, 0x6c, 0x61,
++	0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x09, 0x62, 0x61, 0x6c, 0x61, 0x6e,
++	0x63, 0x69, 0x6e, 0x67, 0x22, 0x1c, 0x0a, 0x1a, 0x41, 0x6c, 0x74, 0x65, 0x72, 0x42, 0x61, 0x6c,
++	0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x22, 0x2e, 0x0a, 0x1a, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x42, 0x61, 0x6c, 0x61,
++	0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
++	0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x74,
++	0x61, 0x67, 0x22, 0x1d, 0x0a, 0x1b, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x42, 0x61, 0x6c, 0x61,
++	0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x22, 0x08, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x32, 0xdf, 0x07, 0x0a, 0x0e,
++	0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x7b,
++	0x0a, 0x15, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x52, 0x6f, 0x75, 0x74, 0x69,
++	0x6e, 0x67, 0x53, 0x74, 0x61, 0x74, 0x73, 0x12, 0x35, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61,
++	0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e,
++	0x64, 0x2e, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x52, 0x6f, 0x75, 0x74, 0x69,
++	0x6e, 0x67, 0x53, 0x74, 0x61, 0x74, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x27,
++	0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72,
++	0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67,
++	0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x22, 0x00, 0x30, 0x01, 0x12, 0x61, 0x0a, 0x09, 0x54,
++	0x65, 0x73, 0x74, 0x52, 0x6f, 0x75, 0x74, 0x65, 0x12, 0x29, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e,
++	0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61,
++	0x6e, 0x64, 0x2e, 0x54, 0x65, 0x73, 0x74, 0x52, 0x6f, 0x75, 0x74, 0x65, 0x52, 0x65, 0x71, 0x75,
++	0x65, 0x73, 0x74, 0x1a, 0x27, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72,
++	0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52, 0x6f,
++	0x75, 0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x22, 0x00, 0x12, 0x73,
++	0x0a, 0x0e, 0x41, 0x64, 0x64, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65,
++	0x12, 0x2e, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
++	0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x41, 0x64, 0x64, 0x52, 0x6f,
++	0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
++	0x1a, 0x2f, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
++	0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x41, 0x64, 0x64, 0x52, 0x6f,
++	0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x22, 0x00, 0x12, 0x79, 0x0a, 0x10, 0x41, 0x6c, 0x74, 0x65, 0x72, 0x52, 0x6f, 0x75, 0x74,
++	0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x12, 0x30, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61,
++	0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e,
++	0x64, 0x2e, 0x41, 0x6c, 0x74, 0x65, 0x72, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75,
++	0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x31, 0x2e, 0x78, 0x72, 0x61, 0x79,
++	0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d,
++	0x61, 0x6e, 0x64, 0x2e, 0x41, 0x6c, 0x74, 0x65, 0x72, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67,
++	0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x7c,
++	0x0a, 0x11, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52,
++	0x75, 0x6c, 0x65, 0x12, 0x31, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72,
++	0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52, 0x65,
++	0x6d, 0x6f, 0x76, 0x65, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52,
++	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x32, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70,
+ 	0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64,
+-	0x2e, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e,
+-	0x67, 0x53, 0x74, 0x61, 0x74, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x27, 0x2e,
++	0x2e, 0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75,
++	0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x79, 0x0a, 0x10,
++	0x41, 0x64, 0x64, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65,
++	0x12, 0x30, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
++	0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x41, 0x64, 0x64, 0x42, 0x61,
++	0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65,
++	0x73, 0x74, 0x1a, 0x31, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f,
++	0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x41, 0x64, 0x64,
++	0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x73,
++	0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x7f, 0x0a, 0x12, 0x41, 0x6c, 0x74, 0x65, 0x72,
++	0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x12, 0x32, 0x2e,
+ 	0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e,
+-	0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x43,
+-	0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x22, 0x00, 0x30, 0x01, 0x12, 0x61, 0x0a, 0x09, 0x54, 0x65,
+-	0x73, 0x74, 0x52, 0x6f, 0x75, 0x74, 0x65, 0x12, 0x29, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61,
+-	0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e,
+-	0x64, 0x2e, 0x54, 0x65, 0x73, 0x74, 0x52, 0x6f, 0x75, 0x74, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65,
+-	0x73, 0x74, 0x1a, 0x27, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f,
+-	0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52, 0x6f, 0x75,
+-	0x74, 0x69, 0x6e, 0x67, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x22, 0x00, 0x42, 0x67, 0x0a,
++	0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x41, 0x6c, 0x74, 0x65, 0x72, 0x42, 0x61, 0x6c,
++	0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x1a, 0x33, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75,
++	0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x41, 0x6c, 0x74, 0x65,
++	0x72, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65,
++	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x12, 0x82, 0x01, 0x0a, 0x13, 0x52, 0x65, 0x6d,
++	0x6f, 0x76, 0x65, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65,
++	0x12, 0x33, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
++	0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e, 0x52, 0x65, 0x6d, 0x6f, 0x76,
++	0x65, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x65,
++	0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x34, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70,
++	0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x2e,
++	0x52, 0x65, 0x6d, 0x6f, 0x76, 0x65, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52,
++	0x75, 0x6c, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x22, 0x00, 0x42, 0x67, 0x0a,
+ 	0x1b, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f,
+ 	0x75, 0x74, 0x65, 0x72, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x61, 0x6e, 0x64, 0x50, 0x01, 0x5a, 0x2c,
+ 	0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f,
+@@ -431,28 +1052,58 @@ func file_app_router_command_command_proto_rawDescGZIP() []byte {
+ 	return file_app_router_command_command_proto_rawDescData
+ }
+ 
+-var file_app_router_command_command_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
++var file_app_router_command_command_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+ var file_app_router_command_command_proto_goTypes = []interface{}{
+ 	(*RoutingContext)(nil),               // 0: xray.app.router.command.RoutingContext
+ 	(*SubscribeRoutingStatsRequest)(nil), // 1: xray.app.router.command.SubscribeRoutingStatsRequest
+ 	(*TestRouteRequest)(nil),             // 2: xray.app.router.command.TestRouteRequest
+-	(*Config)(nil),                       // 3: xray.app.router.command.Config
+-	nil,                                  // 4: xray.app.router.command.RoutingContext.AttributesEntry
+-	(net.Network)(0),                     // 5: xray.common.net.Network
++	(*AddRoutingRuleRequest)(nil),        // 3: xray.app.router.command.AddRoutingRuleRequest
++	(*AddRoutingRuleResponse)(nil),       // 4: xray.app.router.command.AddRoutingRuleResponse
++	(*AlterRoutingRuleRequest)(nil),      // 5: xray.app.router.command.AlterRoutingRuleRequest
++	(*AlterRoutingRuleResponse)(nil),     // 6: xray.app.router.command.AlterRoutingRuleResponse
++	(*RemoveRoutingRuleRequest)(nil),     // 7: xray.app.router.command.RemoveRoutingRuleRequest
++	(*RemoveRoutingRuleResponse)(nil),    // 8: xray.app.router.command.RemoveRoutingRuleResponse
++	(*AddBalancingRuleRequest)(nil),      // 9: xray.app.router.command.AddBalancingRuleRequest
++	(*AddBalancingRuleResponse)(nil),     // 10: xray.app.router.command.AddBalancingRuleResponse
++	(*AlterBalancingRuleRequest)(nil),    // 11: xray.app.router.command.AlterBalancingRuleRequest
++	(*AlterBalancingRuleResponse)(nil),   // 12: xray.app.router.command.AlterBalancingRuleResponse
++	(*RemoveBalancingRuleRequest)(nil),   // 13: xray.app.router.command.RemoveBalancingRuleRequest
++	(*RemoveBalancingRuleResponse)(nil),  // 14: xray.app.router.command.RemoveBalancingRuleResponse
++	(*Config)(nil),                       // 15: xray.app.router.command.Config
++	nil,                                  // 16: xray.app.router.command.RoutingContext.AttributesEntry
++	(net.Network)(0),                     // 17: xray.common.net.Network
++	(*router.RoutingRule)(nil),           // 18: xray.app.router.RoutingRule
++	(*router.BalancingRule)(nil),         // 19: xray.app.router.BalancingRule
+ }
+ var file_app_router_command_command_proto_depIdxs = []int32{
+-	5, // 0: xray.app.router.command.RoutingContext.Network:type_name -> xray.common.net.Network
+-	4, // 1: xray.app.router.command.RoutingContext.Attributes:type_name -> xray.app.router.command.RoutingContext.AttributesEntry
+-	0, // 2: xray.app.router.command.TestRouteRequest.RoutingContext:type_name -> xray.app.router.command.RoutingContext
+-	1, // 3: xray.app.router.command.RoutingService.SubscribeRoutingStats:input_type -> xray.app.router.command.SubscribeRoutingStatsRequest
+-	2, // 4: xray.app.router.command.RoutingService.TestRoute:input_type -> xray.app.router.command.TestRouteRequest
+-	0, // 5: xray.app.router.command.RoutingService.SubscribeRoutingStats:output_type -> xray.app.router.command.RoutingContext
+-	0, // 6: xray.app.router.command.RoutingService.TestRoute:output_type -> xray.app.router.command.RoutingContext
+-	5, // [5:7] is the sub-list for method output_type
+-	3, // [3:5] is the sub-list for method input_type
+-	3, // [3:3] is the sub-list for extension type_name
+-	3, // [3:3] is the sub-list for extension extendee
+-	0, // [0:3] is the sub-list for field type_name
++	17, // 0: xray.app.router.command.RoutingContext.Network:type_name -> xray.common.net.Network
++	16, // 1: xray.app.router.command.RoutingContext.Attributes:type_name -> xray.app.router.command.RoutingContext.AttributesEntry
++	0,  // 2: xray.app.router.command.TestRouteRequest.RoutingContext:type_name -> xray.app.router.command.RoutingContext
++	18, // 3: xray.app.router.command.AddRoutingRuleRequest.routingRule:type_name -> xray.app.router.RoutingRule
++	18, // 4: xray.app.router.command.AlterRoutingRuleRequest.routingRule:type_name -> xray.app.router.RoutingRule
++	19, // 5: xray.app.router.command.AddBalancingRuleRequest.balancing:type_name -> xray.app.router.BalancingRule
++	19, // 6: xray.app.router.command.AlterBalancingRuleRequest.balancing:type_name -> xray.app.router.BalancingRule
++	1,  // 7: xray.app.router.command.RoutingService.SubscribeRoutingStats:input_type -> xray.app.router.command.SubscribeRoutingStatsRequest
++	2,  // 8: xray.app.router.command.RoutingService.TestRoute:input_type -> xray.app.router.command.TestRouteRequest
++	3,  // 9: xray.app.router.command.RoutingService.AddRoutingRule:input_type -> xray.app.router.command.AddRoutingRuleRequest
++	5,  // 10: xray.app.router.command.RoutingService.AlterRoutingRule:input_type -> xray.app.router.command.AlterRoutingRuleRequest
++	7,  // 11: xray.app.router.command.RoutingService.RemoveRoutingRule:input_type -> xray.app.router.command.RemoveRoutingRuleRequest
++	9,  // 12: xray.app.router.command.RoutingService.AddBalancingRule:input_type -> xray.app.router.command.AddBalancingRuleRequest
++	11, // 13: xray.app.router.command.RoutingService.AlterBalancingRule:input_type -> xray.app.router.command.AlterBalancingRuleRequest
++	13, // 14: xray.app.router.command.RoutingService.RemoveBalancingRule:input_type -> xray.app.router.command.RemoveBalancingRuleRequest
++	0,  // 15: xray.app.router.command.RoutingService.SubscribeRoutingStats:output_type -> xray.app.router.command.RoutingContext
++	0,  // 16: xray.app.router.command.RoutingService.TestRoute:output_type -> xray.app.router.command.RoutingContext
++	4,  // 17: xray.app.router.command.RoutingService.AddRoutingRule:output_type -> xray.app.router.command.AddRoutingRuleResponse
++	6,  // 18: xray.app.router.command.RoutingService.AlterRoutingRule:output_type -> xray.app.router.command.AlterRoutingRuleResponse
++	8,  // 19: xray.app.router.command.RoutingService.RemoveRoutingRule:output_type -> xray.app.router.command.RemoveRoutingRuleResponse
++	10, // 20: xray.app.router.command.RoutingService.AddBalancingRule:output_type -> xray.app.router.command.AddBalancingRuleResponse
++	12, // 21: xray.app.router.command.RoutingService.AlterBalancingRule:output_type -> xray.app.router.command.AlterBalancingRuleResponse
++	14, // 22: xray.app.router.command.RoutingService.RemoveBalancingRule:output_type -> xray.app.router.command.RemoveBalancingRuleResponse
++	15, // [15:23] is the sub-list for method output_type
++	7,  // [7:15] is the sub-list for method input_type
++	7,  // [7:7] is the sub-list for extension type_name
++	7,  // [7:7] is the sub-list for extension extendee
++	0,  // [0:7] is the sub-list for field type_name
+ }
+ 
+ func init() { file_app_router_command_command_proto_init() }
+@@ -498,6 +1149,150 @@ func file_app_router_command_command_proto_init() {
+ 			}
+ 		}
+ 		file_app_router_command_command_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AddRoutingRuleRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AddRoutingRuleResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AlterRoutingRuleRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AlterRoutingRuleResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RemoveRoutingRuleRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[8].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RemoveRoutingRuleResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[9].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AddBalancingRuleRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[10].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AddBalancingRuleResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[11].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AlterBalancingRuleRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[12].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AlterBalancingRuleResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[13].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RemoveBalancingRuleRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[14].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RemoveBalancingRuleResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_app_router_command_command_proto_msgTypes[15].Exporter = func(v interface{}, i int) interface{} {
+ 			switch v := v.(*Config); i {
+ 			case 0:
+ 				return &v.state
+@@ -516,7 +1311,7 @@ func file_app_router_command_command_proto_init() {
+ 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+ 			RawDescriptor: file_app_router_command_command_proto_rawDesc,
+ 			NumEnums:      0,
+-			NumMessages:   5,
++			NumMessages:   17,
+ 			NumExtensions: 0,
+ 			NumServices:   1,
+ 		},
+diff --git a/app/router/command/command.proto b/app/router/command/command.proto
+index 5f77704..fcc165f 100644
+--- a/app/router/command/command.proto
++++ b/app/router/command/command.proto
+@@ -7,6 +7,7 @@ option java_package = "com.xray.app.router.command";
+ option java_multiple_files = true;
+ 
+ import "common/net/network.proto";
++import "app/router/config.proto";
+ 
+ // RoutingContext is the context with information relative to routing process.
+ // It conforms to the structure of xray.features.routing.Context and
+@@ -24,6 +25,7 @@ message RoutingContext {
+   map<string, string> Attributes = 10;
+   repeated string OutboundGroupTags = 11;
+   string OutboundTag = 12;
++  string Tag = 13;
+ }
+ 
+ // SubscribeRoutingStatsRequest subscribes to routing statistics channel if
+@@ -60,10 +62,49 @@ message TestRouteRequest {
+   bool PublishResult = 3;
+ }
+ 
++message AddRoutingRuleRequest{
++  xray.app.router.RoutingRule routingRule = 1;
++}
++
++message AddRoutingRuleResponse {}
++
++message AlterRoutingRuleRequest{
++  string tag = 1;
++  xray.app.router.RoutingRule routingRule = 2;
++}
++message AlterRoutingRuleResponse {}
++
++message RemoveRoutingRuleRequest{
++  string tag = 1;
++}
++message RemoveRoutingRuleResponse {}
++
++message AddBalancingRuleRequest{
++  xray.app.router.BalancingRule balancing = 1;
++}
++
++message AddBalancingRuleResponse {}
++
++message AlterBalancingRuleRequest{
++  string tag = 1;
++  xray.app.router.BalancingRule balancing = 2;
++}
++message AlterBalancingRuleResponse {}
++
++message RemoveBalancingRuleRequest{
++  string tag = 1;
++}
++message RemoveBalancingRuleResponse {}
++
+ service RoutingService {
+-  rpc SubscribeRoutingStats(SubscribeRoutingStatsRequest)
+-      returns (stream RoutingContext) {}
++  rpc SubscribeRoutingStats(SubscribeRoutingStatsRequest) returns (stream RoutingContext) {}
+   rpc TestRoute(TestRouteRequest) returns (RoutingContext) {}
++  rpc AddRoutingRule(AddRoutingRuleRequest) returns (AddRoutingRuleResponse){}
++  rpc AlterRoutingRule(AlterRoutingRuleRequest) returns (AlterRoutingRuleResponse){}
++  rpc RemoveRoutingRule(RemoveRoutingRuleRequest) returns (RemoveRoutingRuleResponse){}
++  rpc AddBalancingRule(AddBalancingRuleRequest) returns (AddBalancingRuleResponse){}
++  rpc AlterBalancingRule(AlterBalancingRuleRequest) returns (AlterBalancingRuleResponse){}
++  rpc RemoveBalancingRule(RemoveBalancingRuleRequest) returns (RemoveBalancingRuleResponse){}
+ }
+ 
+ message Config {}
+diff --git a/app/router/command/command_grpc.pb.go b/app/router/command/command_grpc.pb.go
+index 663442b..8e0432e 100644
+--- a/app/router/command/command_grpc.pb.go
++++ b/app/router/command/command_grpc.pb.go
+@@ -9,17 +9,26 @@ import (
+ 	status "google.golang.org/grpc/status"
+ )
+ 
++// Reference imports to suppress errors if they are not otherwise used.
++var _ context.Context
++var _ grpc.ClientConnInterface
++
+ // This is a compile-time assertion to ensure that this generated file
+ // is compatible with the grpc package it is being compiled against.
+-// Requires gRPC-Go v1.32.0 or later.
+-const _ = grpc.SupportPackageIsVersion7
++const _ = grpc.SupportPackageIsVersion6
+ 
+ // RoutingServiceClient is the client API for RoutingService service.
+ //
+-// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
++// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
+ type RoutingServiceClient interface {
+ 	SubscribeRoutingStats(ctx context.Context, in *SubscribeRoutingStatsRequest, opts ...grpc.CallOption) (RoutingService_SubscribeRoutingStatsClient, error)
+ 	TestRoute(ctx context.Context, in *TestRouteRequest, opts ...grpc.CallOption) (*RoutingContext, error)
++	AddRoutingRule(ctx context.Context, in *AddRoutingRuleRequest, opts ...grpc.CallOption) (*AddRoutingRuleResponse, error)
++	AlterRoutingRule(ctx context.Context, in *AlterRoutingRuleRequest, opts ...grpc.CallOption) (*AlterRoutingRuleResponse, error)
++	RemoveRoutingRule(ctx context.Context, in *RemoveRoutingRuleRequest, opts ...grpc.CallOption) (*RemoveRoutingRuleResponse, error)
++	AddBalancingRule(ctx context.Context, in *AddBalancingRuleRequest, opts ...grpc.CallOption) (*AddBalancingRuleResponse, error)
++	AlterBalancingRule(ctx context.Context, in *AlterBalancingRuleRequest, opts ...grpc.CallOption) (*AlterBalancingRuleResponse, error)
++	RemoveBalancingRule(ctx context.Context, in *RemoveBalancingRuleRequest, opts ...grpc.CallOption) (*RemoveBalancingRuleResponse, error)
+ }
+ 
+ type routingServiceClient struct {
+@@ -71,35 +80,102 @@ func (c *routingServiceClient) TestRoute(ctx context.Context, in *TestRouteReque
+ 	return out, nil
+ }
+ 
++func (c *routingServiceClient) AddRoutingRule(ctx context.Context, in *AddRoutingRuleRequest, opts ...grpc.CallOption) (*AddRoutingRuleResponse, error) {
++	out := new(AddRoutingRuleResponse)
++	err := c.cc.Invoke(ctx, "/xray.app.router.command.RoutingService/AddRoutingRule", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *routingServiceClient) AlterRoutingRule(ctx context.Context, in *AlterRoutingRuleRequest, opts ...grpc.CallOption) (*AlterRoutingRuleResponse, error) {
++	out := new(AlterRoutingRuleResponse)
++	err := c.cc.Invoke(ctx, "/xray.app.router.command.RoutingService/AlterRoutingRule", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *routingServiceClient) RemoveRoutingRule(ctx context.Context, in *RemoveRoutingRuleRequest, opts ...grpc.CallOption) (*RemoveRoutingRuleResponse, error) {
++	out := new(RemoveRoutingRuleResponse)
++	err := c.cc.Invoke(ctx, "/xray.app.router.command.RoutingService/RemoveRoutingRule", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *routingServiceClient) AddBalancingRule(ctx context.Context, in *AddBalancingRuleRequest, opts ...grpc.CallOption) (*AddBalancingRuleResponse, error) {
++	out := new(AddBalancingRuleResponse)
++	err := c.cc.Invoke(ctx, "/xray.app.router.command.RoutingService/AddBalancingRule", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *routingServiceClient) AlterBalancingRule(ctx context.Context, in *AlterBalancingRuleRequest, opts ...grpc.CallOption) (*AlterBalancingRuleResponse, error) {
++	out := new(AlterBalancingRuleResponse)
++	err := c.cc.Invoke(ctx, "/xray.app.router.command.RoutingService/AlterBalancingRule", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *routingServiceClient) RemoveBalancingRule(ctx context.Context, in *RemoveBalancingRuleRequest, opts ...grpc.CallOption) (*RemoveBalancingRuleResponse, error) {
++	out := new(RemoveBalancingRuleResponse)
++	err := c.cc.Invoke(ctx, "/xray.app.router.command.RoutingService/RemoveBalancingRule", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ // RoutingServiceServer is the server API for RoutingService service.
+-// All implementations must embed UnimplementedRoutingServiceServer
+-// for forward compatibility
+ type RoutingServiceServer interface {
+ 	SubscribeRoutingStats(*SubscribeRoutingStatsRequest, RoutingService_SubscribeRoutingStatsServer) error
+ 	TestRoute(context.Context, *TestRouteRequest) (*RoutingContext, error)
+-	mustEmbedUnimplementedRoutingServiceServer()
++	AddRoutingRule(context.Context, *AddRoutingRuleRequest) (*AddRoutingRuleResponse, error)
++	AlterRoutingRule(context.Context, *AlterRoutingRuleRequest) (*AlterRoutingRuleResponse, error)
++	RemoveRoutingRule(context.Context, *RemoveRoutingRuleRequest) (*RemoveRoutingRuleResponse, error)
++	AddBalancingRule(context.Context, *AddBalancingRuleRequest) (*AddBalancingRuleResponse, error)
++	AlterBalancingRule(context.Context, *AlterBalancingRuleRequest) (*AlterBalancingRuleResponse, error)
++	RemoveBalancingRule(context.Context, *RemoveBalancingRuleRequest) (*RemoveBalancingRuleResponse, error)
+ }
+ 
+-// UnimplementedRoutingServiceServer must be embedded to have forward compatible implementations.
++// UnimplementedRoutingServiceServer can be embedded to have forward compatible implementations.
+ type UnimplementedRoutingServiceServer struct {
+ }
+ 
+-func (UnimplementedRoutingServiceServer) SubscribeRoutingStats(*SubscribeRoutingStatsRequest, RoutingService_SubscribeRoutingStatsServer) error {
++func (*UnimplementedRoutingServiceServer) SubscribeRoutingStats(*SubscribeRoutingStatsRequest, RoutingService_SubscribeRoutingStatsServer) error {
+ 	return status.Errorf(codes.Unimplemented, "method SubscribeRoutingStats not implemented")
+ }
+-func (UnimplementedRoutingServiceServer) TestRoute(context.Context, *TestRouteRequest) (*RoutingContext, error) {
++func (*UnimplementedRoutingServiceServer) TestRoute(context.Context, *TestRouteRequest) (*RoutingContext, error) {
+ 	return nil, status.Errorf(codes.Unimplemented, "method TestRoute not implemented")
+ }
+-func (UnimplementedRoutingServiceServer) mustEmbedUnimplementedRoutingServiceServer() {}
+-
+-// UnsafeRoutingServiceServer may be embedded to opt out of forward compatibility for this service.
+-// Use of this interface is not recommended, as added methods to RoutingServiceServer will
+-// result in compilation errors.
+-type UnsafeRoutingServiceServer interface {
+-	mustEmbedUnimplementedRoutingServiceServer()
++func (*UnimplementedRoutingServiceServer) AddRoutingRule(context.Context, *AddRoutingRuleRequest) (*AddRoutingRuleResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method AddRoutingRule not implemented")
++}
++func (*UnimplementedRoutingServiceServer) AlterRoutingRule(context.Context, *AlterRoutingRuleRequest) (*AlterRoutingRuleResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method AlterRoutingRule not implemented")
++}
++func (*UnimplementedRoutingServiceServer) RemoveRoutingRule(context.Context, *RemoveRoutingRuleRequest) (*RemoveRoutingRuleResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method RemoveRoutingRule not implemented")
++}
++func (*UnimplementedRoutingServiceServer) AddBalancingRule(context.Context, *AddBalancingRuleRequest) (*AddBalancingRuleResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method AddBalancingRule not implemented")
++}
++func (*UnimplementedRoutingServiceServer) AlterBalancingRule(context.Context, *AlterBalancingRuleRequest) (*AlterBalancingRuleResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method AlterBalancingRule not implemented")
++}
++func (*UnimplementedRoutingServiceServer) RemoveBalancingRule(context.Context, *RemoveBalancingRuleRequest) (*RemoveBalancingRuleResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method RemoveBalancingRule not implemented")
+ }
+ 
+-func RegisterRoutingServiceServer(s grpc.ServiceRegistrar, srv RoutingServiceServer) {
++func RegisterRoutingServiceServer(s *grpc.Server, srv RoutingServiceServer) {
+ 	s.RegisterService(&RoutingService_ServiceDesc, srv)
+ }
+ 
+@@ -142,9 +218,114 @@ func _RoutingService_TestRoute_Handler(srv interface{}, ctx context.Context, dec
+ 	return interceptor(ctx, in, info, handler)
+ }
+ 
+-// RoutingService_ServiceDesc is the grpc.ServiceDesc for RoutingService service.
+-// It's only intended for direct use with grpc.RegisterService,
+-// and not to be introspected or modified (even as a copy)
++func _RoutingService_AddRoutingRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(AddRoutingRuleRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(RoutingServiceServer).AddRoutingRule(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/xray.app.router.command.RoutingService/AddRoutingRule",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(RoutingServiceServer).AddRoutingRule(ctx, req.(*AddRoutingRuleRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _RoutingService_AlterRoutingRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(AlterRoutingRuleRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(RoutingServiceServer).AlterRoutingRule(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/xray.app.router.command.RoutingService/AlterRoutingRule",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(RoutingServiceServer).AlterRoutingRule(ctx, req.(*AlterRoutingRuleRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _RoutingService_RemoveRoutingRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RemoveRoutingRuleRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(RoutingServiceServer).RemoveRoutingRule(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/xray.app.router.command.RoutingService/RemoveRoutingRule",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(RoutingServiceServer).RemoveRoutingRule(ctx, req.(*RemoveRoutingRuleRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _RoutingService_AddBalancingRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(AddBalancingRuleRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(RoutingServiceServer).AddBalancingRule(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/xray.app.router.command.RoutingService/AddBalancingRule",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(RoutingServiceServer).AddBalancingRule(ctx, req.(*AddBalancingRuleRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _RoutingService_AlterBalancingRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(AlterBalancingRuleRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(RoutingServiceServer).AlterBalancingRule(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/xray.app.router.command.RoutingService/AlterBalancingRule",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(RoutingServiceServer).AlterBalancingRule(ctx, req.(*AlterBalancingRuleRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _RoutingService_RemoveBalancingRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RemoveBalancingRuleRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(RoutingServiceServer).RemoveBalancingRule(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/xray.app.router.command.RoutingService/RemoveBalancingRule",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(RoutingServiceServer).RemoveBalancingRule(ctx, req.(*RemoveBalancingRuleRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
+ var RoutingService_ServiceDesc = grpc.ServiceDesc{
+ 	ServiceName: "xray.app.router.command.RoutingService",
+ 	HandlerType: (*RoutingServiceServer)(nil),
+@@ -153,6 +334,30 @@ var RoutingService_ServiceDesc = grpc.ServiceDesc{
+ 			MethodName: "TestRoute",
+ 			Handler:    _RoutingService_TestRoute_Handler,
+ 		},
++		{
++			MethodName: "AddRoutingRule",
++			Handler:    _RoutingService_AddRoutingRule_Handler,
++		},
++		{
++			MethodName: "AlterRoutingRule",
++			Handler:    _RoutingService_AlterRoutingRule_Handler,
++		},
++		{
++			MethodName: "RemoveRoutingRule",
++			Handler:    _RoutingService_RemoveRoutingRule_Handler,
++		},
++		{
++			MethodName: "AddBalancingRule",
++			Handler:    _RoutingService_AddBalancingRule_Handler,
++		},
++		{
++			MethodName: "AlterBalancingRule",
++			Handler:    _RoutingService_AlterBalancingRule_Handler,
++		},
++		{
++			MethodName: "RemoveBalancingRule",
++			Handler:    _RoutingService_RemoveBalancingRule_Handler,
++		},
+ 	},
+ 	Streams: []grpc.StreamDesc{
+ 		{
+diff --git a/app/router/command/command_test.go b/app/router/command/command_test.go
+index e8e50cc..e97e898 100644
+--- a/app/router/command/command_test.go
++++ b/app/router/command/command_test.go
+@@ -2,6 +2,8 @@ package command_test
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
+ 	"testing"
+ 	"time"
+ 
+@@ -200,7 +202,7 @@ func TestServiceSubscribeRoutingStats(t *testing.T) {
+ 	}
+ }
+ 
+-func TestSerivceTestRoute(t *testing.T) {
++func TestServiceTestRoute(t *testing.T) {
+ 	c := stats.NewChannel(&stats.ChannelConfig{
+ 		SubscriberLimit: 1,
+ 		BufferSize:      16,
+@@ -216,35 +218,379 @@ func TestSerivceTestRoute(t *testing.T) {
+ 		Rule: []*router.RoutingRule{
+ 			{
+ 				InboundTag: []string{"in"},
+-				TargetTag:  &router.RoutingRule_Tag{Tag: "out"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "out"},
+ 			},
+ 			{
++				Networks:  []net.Network{net.Network_UDP, net.Network_TCP},
+ 				Protocol:  []string{"bittorrent"},
+-				TargetTag: &router.RoutingRule_Tag{Tag: "blocked"},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "blocked"},
+ 			},
+ 			{
+ 				PortList:  &net.PortList{Range: []*net.PortRange{{From: 8080, To: 8080}}},
+-				TargetTag: &router.RoutingRule_Tag{Tag: "out"},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
+ 			},
+ 			{
+ 				SourcePortList: &net.PortList{Range: []*net.PortRange{{From: 9999, To: 9999}}},
+-				TargetTag:      &router.RoutingRule_Tag{Tag: "out"},
++				TargetTag:      &router.RoutingRule_OutboundTag{OutboundTag: "out"},
+ 			},
+ 			{
+ 				Domain:    []*router.Domain{{Type: router.Domain_Domain, Value: "com"}},
+-				TargetTag: &router.RoutingRule_Tag{Tag: "out"},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
+ 			},
+ 			{
+ 				SourceGeoip: []*router.GeoIP{{CountryCode: "private", Cidr: []*router.CIDR{{Ip: []byte{127, 0, 0, 0}, Prefix: 8}}}},
+-				TargetTag:   &router.RoutingRule_Tag{Tag: "out"},
++				TargetTag:   &router.RoutingRule_OutboundTag{OutboundTag: "out"},
+ 			},
+ 			{
+ 				UserEmail: []string{"example@example.com"},
+-				TargetTag: &router.RoutingRule_Tag{Tag: "out"},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++			{
++				Networks:  []net.Network{net.Network_TCP},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++		},
++	}, mocks.NewDNSClient(mockCtl), mocks.NewOutboundManager(mockCtl)))
++
++	lis := bufconn.Listen(1024 * 1024)
++	bufDialer := func(context.Context, string) (net.Conn, error) {
++		return lis.Dial()
++	}
++
++	errCh := make(chan error)
++
++	// Server goroutine
++	go func() {
++		server := grpc.NewServer()
++		RegisterRoutingServiceServer(server, NewRoutingServer(r, c))
++		errCh <- server.Serve(lis)
++	}()
++
++	// Client goroutine
++	go func() {
++		defer lis.Close()
++		conn, err := grpc.DialContext(context.Background(), "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
++		if err != nil {
++			errCh <- err
++		}
++		defer conn.Close()
++		client := NewRoutingServiceClient(conn)
++
++		testCases := []*RoutingContext{
++			{InboundTag: "in", OutboundTag: "out"},
++			{TargetIPs: [][]byte{{1, 2, 3, 4}}, TargetPort: 8080, OutboundTag: "out"},
++			{TargetDomain: "example.com", TargetPort: 443, OutboundTag: "out"},
++			{SourcePort: 9999, TargetPort: 9999, OutboundTag: "out"},
++			{Network: net.Network_UDP, Protocol: "bittorrent", OutboundTag: "blocked"},
++			{User: "example@example.com", OutboundTag: "out"},
++			{SourceIPs: [][]byte{{127, 0, 0, 1}}, Attributes: map[string]string{"attr": "value"}, OutboundTag: "out"},
++		}
++
++		// Test simple TestRoute
++		testSimple := func() error {
++			for _, tc := range testCases {
++				route, err := client.TestRoute(context.Background(), &TestRouteRequest{RoutingContext: tc})
++				if err != nil {
++					return err
++				}
++				if r := cmp.Diff(route, tc, cmpopts.IgnoreUnexported(RoutingContext{})); r != "" {
++					t.Error(r)
++				}
++			}
++			return nil
++		}
++
++		// Test TestRoute with special options
++		testOptions := func() error {
++			sub, err := c.Subscribe()
++			if err != nil {
++				return err
++			}
++			for _, tc := range testCases {
++				route, err := client.TestRoute(context.Background(), &TestRouteRequest{
++					RoutingContext: tc,
++					FieldSelectors: []string{"ip", "port", "domain", "outbound"},
++					PublishResult:  true,
++				})
++				if err != nil {
++					return err
++				}
++				stat := &RoutingContext{ // Only a subset of stats is retrieved
++					SourceIPs:         tc.SourceIPs,
++					TargetIPs:         tc.TargetIPs,
++					SourcePort:        tc.SourcePort,
++					TargetPort:        tc.TargetPort,
++					TargetDomain:      tc.TargetDomain,
++					OutboundGroupTags: tc.OutboundGroupTags,
++					OutboundTag:       tc.OutboundTag,
++				}
++				if r := cmp.Diff(route, stat, cmpopts.IgnoreUnexported(RoutingContext{})); r != "" {
++					t.Error(r)
++				}
++				select { // Check that routing result has been published to statistics channel
++				case msg, received := <-sub:
++					if route, ok := msg.(routing.Route); received && ok {
++						if r := cmp.Diff(AsProtobufMessage(nil)(route), tc, cmpopts.IgnoreUnexported(RoutingContext{})); r != "" {
++							t.Error(r)
++						}
++					} else {
++						t.Error("unexpected failure in receiving published routing result for testcase", tc)
++					}
++				case <-time.After(100 * time.Millisecond):
++					t.Error("unexpected failure in receiving published routing result", tc)
++				}
++			}
++			return nil
++		}
++
++		if err := testSimple(); err != nil {
++			errCh <- err
++		}
++		if err := testOptions(); err != nil {
++			errCh <- err
++		}
++		errCh <- nil // Client passed all tests successfully
++	}()
++
++	// Wait for goroutines to complete
++	select {
++	case <-time.After(2 * time.Second):
++		t.Fatal("Test timeout after 2s")
++	case err := <-errCh:
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++}
++
++func TestServiceAddRoutingRule(t *testing.T) {
++	c := stats.NewChannel(&stats.ChannelConfig{
++		SubscriberLimit: 1,
++		BufferSize:      16,
++		Blocking:        true,
++	})
++	common.Must(c.Start())
++	defer c.Close()
++
++	r := new(router.Router)
++	mockCtl := gomock.NewController(t)
++	defer mockCtl.Finish()
++	common.Must(r.Init(&router.Config{}, mocks.NewDNSClient(mockCtl), mocks.NewOutboundManager(mockCtl)))
++
++	lis := bufconn.Listen(1024 * 1024)
++	bufDialer := func(context.Context, string) (net.Conn, error) {
++		return lis.Dial()
++	}
++
++	errCh := make(chan error)
++
++	// Server goroutine
++	go func() {
++		server := grpc.NewServer()
++		RegisterRoutingServiceServer(server, NewRoutingServer(r, c))
++		errCh <- server.Serve(lis)
++	}()
++
++	// Client goroutine
++	go func() {
++		defer lis.Close()
++		conn, err := grpc.DialContext(context.Background(), "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
++		if err != nil {
++			errCh <- err
++		}
++		defer conn.Close()
++		client := NewRoutingServiceClient(conn)
++
++		testAddRuleCases := []*router.RoutingRule{
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "out"},
+ 			},
+ 			{
+ 				Networks:  []net.Network{net.Network_UDP, net.Network_TCP},
+-				TargetTag: &router.RoutingRule_Tag{Tag: "out"},
++				Protocol:  []string{"bittorrent"},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "blocked"},
++			},
++			{
++				PortList:  &net.PortList{Range: []*net.PortRange{{From: 8080, To: 8080}}},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++			{
++				SourcePortList: &net.PortList{Range: []*net.PortRange{{From: 9999, To: 9999}}},
++				TargetTag:      &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++			{
++				Domain:    []*router.Domain{{Type: router.Domain_Domain, Value: "com"}},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++			{
++				SourceGeoip: []*router.GeoIP{{CountryCode: "private", Cidr: []*router.CIDR{{Ip: []byte{127, 0, 0, 0}, Prefix: 8}}}},
++				TargetTag:   &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++			{
++				UserEmail: []string{"example@example.com"},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++			{
++				Networks:  []net.Network{net.Network_TCP},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++			},
++		}
++
++		// Test add rule
++		testAddRule := func() error {
++			for _, tc := range testAddRuleCases {
++				_, err := client.AddRoutingRule(context.Background(), &AddRoutingRuleRequest{RoutingRule: tc})
++				if err != nil {
++					return err
++				}
++			}
++			return nil
++		}
++
++		testCases := []*RoutingContext{
++			{InboundTag: "in", OutboundTag: "out"},
++			{TargetIPs: [][]byte{{1, 2, 3, 4}}, TargetPort: 8080, OutboundTag: "out"},
++			{TargetDomain: "example.com", TargetPort: 443, OutboundTag: "out"},
++			{SourcePort: 9999, TargetPort: 9999, OutboundTag: "out"},
++			{Network: net.Network_UDP, Protocol: "bittorrent", OutboundTag: "blocked"},
++			{User: "example@example.com", OutboundTag: "out"},
++			{SourceIPs: [][]byte{{127, 0, 0, 1}}, Attributes: map[string]string{"attr": "value"}, OutboundTag: "out"},
++		}
++
++		// Test simple TestRoute
++		testSimple := func() error {
++			for _, tc := range testCases {
++				route, err := client.TestRoute(context.Background(), &TestRouteRequest{RoutingContext: tc})
++				if err != nil {
++					return err
++				}
++				if r := cmp.Diff(route, tc, cmpopts.IgnoreUnexported(RoutingContext{})); r != "" {
++					t.Error(r)
++				}
++			}
++			return nil
++		}
++
++		// Test TestRoute with special options
++		testOptions := func() error {
++			sub, err := c.Subscribe()
++			if err != nil {
++				return err
++			}
++			for _, tc := range testCases {
++				route, err := client.TestRoute(context.Background(), &TestRouteRequest{
++					RoutingContext: tc,
++					FieldSelectors: []string{"ip", "port", "domain", "outbound"},
++					PublishResult:  true,
++				})
++				if err != nil {
++					return err
++				}
++				stat := &RoutingContext{ // Only a subset of stats is retrieved
++					SourceIPs:         tc.SourceIPs,
++					TargetIPs:         tc.TargetIPs,
++					SourcePort:        tc.SourcePort,
++					TargetPort:        tc.TargetPort,
++					TargetDomain:      tc.TargetDomain,
++					OutboundGroupTags: tc.OutboundGroupTags,
++					OutboundTag:       tc.OutboundTag,
++				}
++				if r := cmp.Diff(route, stat, cmpopts.IgnoreUnexported(RoutingContext{})); r != "" {
++					t.Error(r)
++				}
++				select { // Check that routing result has been published to statistics channel
++				case msg, received := <-sub:
++					if route, ok := msg.(routing.Route); received && ok {
++						if r := cmp.Diff(AsProtobufMessage(nil)(route), tc, cmpopts.IgnoreUnexported(RoutingContext{})); r != "" {
++							t.Error(r)
++						}
++					} else {
++						t.Error("unexpected failure in receiving published routing result for testcase", tc)
++					}
++				case <-time.After(100 * time.Millisecond):
++					t.Error("unexpected failure in receiving published routing result", tc)
++				}
++			}
++			return nil
++		}
++
++		if err := testAddRule(); err != nil {
++			errCh <- err
++		}
++		if err := testSimple(); err != nil {
++			errCh <- err
++		}
++		if err := testOptions(); err != nil {
++			errCh <- err
++		}
++		errCh <- nil // Client passed all tests successfully
++	}()
++
++	// Wait for goroutines to complete
++	select {
++	case <-time.After(2 * time.Second):
++		t.Fatal("Test timeout after 2s")
++	case err := <-errCh:
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++}
++
++func TestServiceAlterRoutingRule(t *testing.T) {
++	c := stats.NewChannel(&stats.ChannelConfig{
++		SubscriberLimit: 1,
++		BufferSize:      16,
++		Blocking:        true,
++	})
++	common.Must(c.Start())
++	defer c.Close()
++
++	r := new(router.Router)
++	mockCtl := gomock.NewController(t)
++	defer mockCtl.Finish()
++	common.Must(r.Init(&router.Config{
++		Rule: []*router.RoutingRule{
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "in_out",
++			},
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "udp_bittorrent_blocked",
++			},
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "8080_out",
++			},
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "9999_out",
++			},
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "com_out",
++			},
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "127.0.0.1_out",
++			},
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "example_out",
++			},
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "test"},
++				Tag:        "tcp_out",
+ 			},
+ 		},
+ 	}, mocks.NewDNSClient(mockCtl), mocks.NewOutboundManager(mockCtl)))
+@@ -273,6 +619,77 @@ func TestSerivceTestRoute(t *testing.T) {
+ 		defer conn.Close()
+ 		client := NewRoutingServiceClient(conn)
+ 
++		testAlterRuleCases := []*AlterRoutingRuleRequest{
++			{
++				Tag: "in_out",
++				RoutingRule: &router.RoutingRule{
++					InboundTag: []string{"in"},
++					TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				},
++			},
++			{
++				Tag: "udp_bittorrent_blocked",
++				RoutingRule: &router.RoutingRule{
++					Networks:  []net.Network{net.Network_UDP, net.Network_TCP},
++					Protocol:  []string{"bittorrent"},
++					TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "blocked"},
++				},
++			},
++			{
++				Tag: "8080_out",
++				RoutingRule: &router.RoutingRule{
++					PortList:  &net.PortList{Range: []*net.PortRange{{From: 8080, To: 8080}}},
++					TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				},
++			},
++			{
++				Tag: "9999_out",
++				RoutingRule: &router.RoutingRule{
++					SourcePortList: &net.PortList{Range: []*net.PortRange{{From: 9999, To: 9999}}},
++					TargetTag:      &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				},
++			},
++			{
++				Tag: "com_out",
++				RoutingRule: &router.RoutingRule{
++					Domain:    []*router.Domain{{Type: router.Domain_Domain, Value: "com"}},
++					TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				},
++			},
++			{
++				Tag: "127.0.0.1_out",
++				RoutingRule: &router.RoutingRule{
++					SourceGeoip: []*router.GeoIP{{CountryCode: "private", Cidr: []*router.CIDR{{Ip: []byte{127, 0, 0, 0}, Prefix: 8}}}},
++					TargetTag:   &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				},
++			},
++			{
++				Tag: "example_out",
++				RoutingRule: &router.RoutingRule{
++					UserEmail: []string{"example@example.com"},
++					TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				},
++			},
++			{
++				Tag: "tcp_out",
++				RoutingRule: &router.RoutingRule{
++					Networks:  []net.Network{net.Network_TCP},
++					TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				},
++			},
++		}
++
++		// Test alter rule
++		testAlterRule := func() error {
++			for _, tc := range testAlterRuleCases {
++				_, err := client.AlterRoutingRule(context.Background(), tc)
++				if err != nil {
++					return err
++				}
++			}
++			return nil
++		}
++
+ 		testCases := []*RoutingContext{
+ 			{InboundTag: "in", OutboundTag: "out"},
+ 			{TargetIPs: [][]byte{{1, 2, 3, 4}}, TargetPort: 8080, OutboundTag: "out"},
+@@ -340,6 +757,9 @@ func TestSerivceTestRoute(t *testing.T) {
+ 			return nil
+ 		}
+ 
++		if err := testAlterRule(); err != nil {
++			errCh <- err
++		}
+ 		if err := testSimple(); err != nil {
+ 			errCh <- err
+ 		}
+@@ -359,3 +779,149 @@ func TestSerivceTestRoute(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestServiceRemoveRoutingRule(t *testing.T) {
++	c := stats.NewChannel(&stats.ChannelConfig{
++		SubscriberLimit: 1,
++		BufferSize:      16,
++		Blocking:        true,
++	})
++	common.Must(c.Start())
++	defer c.Close()
++
++	r := new(router.Router)
++	mockCtl := gomock.NewController(t)
++	defer mockCtl.Finish()
++	common.Must(r.Init(&router.Config{
++		Rule: []*router.RoutingRule{
++			{
++				InboundTag: []string{"in"},
++				TargetTag:  &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				Tag:        "in_out",
++			},
++			{
++				Networks:  []net.Network{net.Network_UDP, net.Network_TCP},
++				Protocol:  []string{"bittorrent"},
++				Tag:       "udp_bittorrent_blocked",
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "blocked"},
++			},
++			{
++				PortList:  &net.PortList{Range: []*net.PortRange{{From: 8080, To: 8080}}},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				Tag:       "8080_out",
++			},
++			{
++				SourcePortList: &net.PortList{Range: []*net.PortRange{{From: 9999, To: 9999}}},
++				TargetTag:      &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				Tag:            "9999_out",
++			},
++			{
++				Domain:    []*router.Domain{{Type: router.Domain_Domain, Value: "com"}},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				Tag:       "com_out",
++			},
++			{
++				SourceGeoip: []*router.GeoIP{{CountryCode: "private", Cidr: []*router.CIDR{{Ip: []byte{127, 0, 0, 0}, Prefix: 8}}}},
++				TargetTag:   &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				Tag:         "127.0.0.1_out",
++			},
++			{
++				UserEmail: []string{"example@example.com"},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				Tag:       "example_out",
++			},
++			{
++				Networks:  []net.Network{net.Network_TCP},
++				TargetTag: &router.RoutingRule_OutboundTag{OutboundTag: "out"},
++				Tag:       "tcp_out",
++			},
++		},
++	}, mocks.NewDNSClient(mockCtl), mocks.NewOutboundManager(mockCtl)))
++
++	lis := bufconn.Listen(1024 * 1024)
++	bufDialer := func(context.Context, string) (net.Conn, error) {
++		return lis.Dial()
++	}
++
++	errCh := make(chan error)
++
++	// Server goroutine
++	go func() {
++		server := grpc.NewServer()
++		RegisterRoutingServiceServer(server, NewRoutingServer(r, c))
++		errCh <- server.Serve(lis)
++	}()
++
++	// Client goroutine
++	go func() {
++		defer lis.Close()
++		conn, err := grpc.DialContext(context.Background(), "bufnet", grpc.WithContextDialer(bufDialer), grpc.WithInsecure())
++		if err != nil {
++			errCh <- err
++		}
++		defer conn.Close()
++		client := NewRoutingServiceClient(conn)
++
++		testRemoveRuleCases := []string{
++			"in_out",
++			"udp_bittorrent_blocked",
++			"8080_out",
++			"9999_out",
++			"com_out",
++			"127.0.0.1_out",
++			"example_out",
++			"tcp_out",
++		}
++
++		// Test alter rule
++		testRemoveRule := func() error {
++			for _, tc := range testRemoveRuleCases {
++				_, err := client.RemoveRoutingRule(context.Background(), &RemoveRoutingRuleRequest{Tag: tc})
++				if err != nil {
++					return err
++				}
++			}
++			return nil
++		}
++
++		testCases := []*RoutingContext{
++			{InboundTag: "in", OutboundTag: "out"},
++			{TargetIPs: [][]byte{{1, 2, 3, 4}}, TargetPort: 8080, OutboundTag: "out"},
++			{TargetDomain: "example.com", TargetPort: 443, OutboundTag: "out"},
++			{SourcePort: 9999, TargetPort: 9999, OutboundTag: "out"},
++			{Network: net.Network_UDP, Protocol: "bittorrent", OutboundTag: "blocked"},
++			{User: "example@example.com", OutboundTag: "out"},
++			{SourceIPs: [][]byte{{127, 0, 0, 1}}, Attributes: map[string]string{"attr": "value"}, OutboundTag: "out"},
++		}
++
++		// Test simple TestRoute
++		testSimple := func() error {
++			for _, tc := range testCases {
++				route, err := client.TestRoute(context.Background(), &TestRouteRequest{RoutingContext: tc})
++				if err == nil {
++					return errors.New(fmt.Sprintf("Delete route failed, remaining route:[%s]", route.Tag))
++				}
++			}
++			return nil
++		}
++
++		if err := testRemoveRule(); err != nil {
++			errCh <- err
++		}
++		if err := testSimple(); err != nil {
++			errCh <- err
++		}
++		errCh <- nil // Client passed all tests successfully
++	}()
++
++	// Wait for goroutines to complete
++	select {
++	case <-time.After(2 * time.Second):
++		t.Fatal("Test timeout after 2s")
++	case err := <-errCh:
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++}
++
+diff --git a/app/router/command/config.go b/app/router/command/config.go
+index e95418d..e5fcb2d 100644
+--- a/app/router/command/config.go
++++ b/app/router/command/config.go
+@@ -51,6 +51,7 @@ var fieldMap = map[string]func(*RoutingContext, routing.Route){
+ 	"attributes":     func(s *RoutingContext, r routing.Route) { s.Attributes = r.GetAttributes() },
+ 	"outbound_group": func(s *RoutingContext, r routing.Route) { s.OutboundGroupTags = r.GetOutboundGroupTags() },
+ 	"outbound":       func(s *RoutingContext, r routing.Route) { s.OutboundTag = r.GetOutboundTag() },
++	"tag":            func(s *RoutingContext, r routing.Route) { s.Tag = r.GetTag() },
+ }
+ 
+ // AsProtobufMessage takes selectors of fields and returns a function to convert routing.Route to protobuf RoutingContext.
+diff --git a/app/router/config.go b/app/router/config.go
+index 07167a5..196eaff 100644
+--- a/app/router/config.go
++++ b/app/router/config.go
+@@ -2,6 +2,7 @@ package router
+ 
+ import (
+ 	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/uuid"
+ 	"github.com/xtls/xray-core/features/outbound"
+ 	"github.com/xtls/xray-core/features/routing"
+ )
+@@ -47,15 +48,16 @@ func (l *CIDRList) Swap(i int, j int) {
+ 
+ type Rule struct {
+ 	Tag       string
++	TargetTag string
+ 	Balancer  *Balancer
+ 	Condition Condition
+ }
+ 
+-func (r *Rule) GetTag() (string, error) {
++func (r *Rule) GetTargetTag() (string, error) {
+ 	if r.Balancer != nil {
+ 		return r.Balancer.PickOutbound()
+ 	}
+-	return r.Tag, nil
++	return r.TargetTag, nil
+ }
+ 
+ // Apply checks rule matching of current routing context.
+@@ -145,6 +147,42 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
+ 	return conds, nil
+ }
+ 
++// Build RoutingRule translates into Rule.
++func (rr *RoutingRule) Build(r *Router) (*Rule, error) {
++	tag := rr.Tag
++	rule := &Rule{
++		Tag: tag,
++	}
++
++	if len(rule.Tag) > 0 {
++		if _, found := r.rules[tag]; found {
++			return nil, newError("existing tag found: " + tag)
++		}
++	} else {
++		u := uuid.New()
++		rule.Tag = u.String()
++	}
++
++	btag := rr.GetBalancingTag()
++	if len(btag) > 0 {
++		brule, found := r.balancers[btag]
++		if !found {
++			return nil, newError("balancer ", btag, " not found")
++		}
++		rule.Balancer = brule
++	} else {
++		rule.TargetTag = rr.GetTargetTag().(*RoutingRule_OutboundTag).OutboundTag
++	}
++
++	cond, err := rr.BuildCondition()
++	if err != nil {
++		return nil, err
++	}
++
++	rule.Condition = cond
++	return rule, nil
++}
++
+ func (br *BalancingRule) Build(ohm outbound.Manager) (*Balancer, error) {
+ 	return &Balancer{
+ 		selectors: br.OutboundSelector,
+diff --git a/app/router/config.pb.go b/app/router/config.pb.go
+index 69abd37..e3581d4 100644
+--- a/app/router/config.pb.go
++++ b/app/router/config.pb.go
+@@ -1,13 +1,12 @@
+ // Code generated by protoc-gen-go. DO NOT EDIT.
+ // versions:
+-// 	protoc-gen-go v1.25.0
+-// 	protoc        v3.14.0
++// 	protoc-gen-go v1.26.0
++// 	protoc        v3.15.6
+ // source: app/router/config.proto
+ 
+ package router
+ 
+ import (
+-	proto "github.com/golang/protobuf/proto"
+ 	net "github.com/xtls/xray-core/common/net"
+ 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+ 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+@@ -22,10 +21,6 @@ const (
+ 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+ )
+ 
+-// This is a compile-time assertion that a sufficiently up-to-date version
+-// of the legacy proto package is being used.
+-const _ = proto.ProtoPackageIsVersion4
+-
+ // Type of domain value.
+ type Domain_Type int32
+ 
+@@ -474,7 +469,7 @@ type RoutingRule struct {
+ 	unknownFields protoimpl.UnknownFields
+ 
+ 	// Types that are assignable to TargetTag:
+-	//	*RoutingRule_Tag
++	//	*RoutingRule_OutboundTag
+ 	//	*RoutingRule_BalancingTag
+ 	TargetTag isRoutingRule_TargetTag `protobuf_oneof:"target_tag"`
+ 	// List of domains for target domain matching.
+@@ -515,6 +510,7 @@ type RoutingRule struct {
+ 	InboundTag     []string      `protobuf:"bytes,8,rep,name=inbound_tag,json=inboundTag,proto3" json:"inbound_tag,omitempty"`
+ 	Protocol       []string      `protobuf:"bytes,9,rep,name=protocol,proto3" json:"protocol,omitempty"`
+ 	Attributes     string        `protobuf:"bytes,15,opt,name=attributes,proto3" json:"attributes,omitempty"`
++	Tag            string        `protobuf:"bytes,17,opt,name=tag,proto3" json:"tag,omitempty"`
+ }
+ 
+ func (x *RoutingRule) Reset() {
+@@ -556,9 +552,9 @@ func (m *RoutingRule) GetTargetTag() isRoutingRule_TargetTag {
+ 	return nil
+ }
+ 
+-func (x *RoutingRule) GetTag() string {
+-	if x, ok := x.GetTargetTag().(*RoutingRule_Tag); ok {
+-		return x.Tag
++func (x *RoutingRule) GetOutboundTag() string {
++	if x, ok := x.GetTargetTag().(*RoutingRule_OutboundTag); ok {
++		return x.OutboundTag
+ 	}
+ 	return ""
+ }
+@@ -672,13 +668,20 @@ func (x *RoutingRule) GetAttributes() string {
+ 	return ""
+ }
+ 
++func (x *RoutingRule) GetTag() string {
++	if x != nil {
++		return x.Tag
++	}
++	return ""
++}
++
+ type isRoutingRule_TargetTag interface {
+ 	isRoutingRule_TargetTag()
+ }
+ 
+-type RoutingRule_Tag struct {
++type RoutingRule_OutboundTag struct {
+ 	// Tag of outbound that this rule is pointing to.
+-	Tag string `protobuf:"bytes,1,opt,name=tag,proto3,oneof"`
++	OutboundTag string `protobuf:"bytes,1,opt,name=outbound_tag,json=outboundTag,proto3,oneof"`
+ }
+ 
+ type RoutingRule_BalancingTag struct {
+@@ -686,7 +689,7 @@ type RoutingRule_BalancingTag struct {
+ 	BalancingTag string `protobuf:"bytes,12,opt,name=balancing_tag,json=balancingTag,proto3,oneof"`
+ }
+ 
+-func (*RoutingRule_Tag) isRoutingRule_TargetTag() {}
++func (*RoutingRule_OutboundTag) isRoutingRule_TargetTag() {}
+ 
+ func (*RoutingRule_BalancingTag) isRoutingRule_TargetTag() {}
+ 
+@@ -946,84 +949,86 @@ var file_app_router_config_proto_rawDesc = []byte{
+ 	0x74, 0x12, 0x2e, 0x0a, 0x05, 0x65, 0x6e, 0x74, 0x72, 0x79, 0x18, 0x01, 0x20, 0x03, 0x28, 0x0b,
+ 	0x32, 0x18, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74,
+ 	0x65, 0x72, 0x2e, 0x47, 0x65, 0x6f, 0x53, 0x69, 0x74, 0x65, 0x52, 0x05, 0x65, 0x6e, 0x74, 0x72,
+-	0x79, 0x22, 0x8e, 0x06, 0x0a, 0x0b, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c,
+-	0x65, 0x12, 0x12, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x48, 0x00,
+-	0x52, 0x03, 0x74, 0x61, 0x67, 0x12, 0x25, 0x0a, 0x0d, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69,
+-	0x6e, 0x67, 0x5f, 0x74, 0x61, 0x67, 0x18, 0x0c, 0x20, 0x01, 0x28, 0x09, 0x48, 0x00, 0x52, 0x0c,
+-	0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x54, 0x61, 0x67, 0x12, 0x2f, 0x0a, 0x06,
+-	0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x18, 0x02, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x17, 0x2e, 0x78,
+-	0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x44,
+-	0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x52, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x12, 0x2d, 0x0a,
+-	0x04, 0x63, 0x69, 0x64, 0x72, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x15, 0x2e, 0x78, 0x72,
+-	0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x43, 0x49,
+-	0x44, 0x52, 0x42, 0x02, 0x18, 0x01, 0x52, 0x04, 0x63, 0x69, 0x64, 0x72, 0x12, 0x2c, 0x0a, 0x05,
+-	0x67, 0x65, 0x6f, 0x69, 0x70, 0x18, 0x0a, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x16, 0x2e, 0x78, 0x72,
+-	0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x47, 0x65,
+-	0x6f, 0x49, 0x50, 0x52, 0x05, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x12, 0x3d, 0x0a, 0x0a, 0x70, 0x6f,
+-	0x72, 0x74, 0x5f, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1a,
+-	0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74,
+-	0x2e, 0x50, 0x6f, 0x72, 0x74, 0x52, 0x61, 0x6e, 0x67, 0x65, 0x42, 0x02, 0x18, 0x01, 0x52, 0x09,
+-	0x70, 0x6f, 0x72, 0x74, 0x52, 0x61, 0x6e, 0x67, 0x65, 0x12, 0x36, 0x0a, 0x09, 0x70, 0x6f, 0x72,
+-	0x74, 0x5f, 0x6c, 0x69, 0x73, 0x74, 0x18, 0x0e, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x19, 0x2e, 0x78,
+-	0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x50,
+-	0x6f, 0x72, 0x74, 0x4c, 0x69, 0x73, 0x74, 0x52, 0x08, 0x70, 0x6f, 0x72, 0x74, 0x4c, 0x69, 0x73,
+-	0x74, 0x12, 0x43, 0x0a, 0x0c, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x5f, 0x6c, 0x69, 0x73,
+-	0x74, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1c, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63,
+-	0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x4e, 0x65, 0x74, 0x77, 0x6f, 0x72,
+-	0x6b, 0x4c, 0x69, 0x73, 0x74, 0x42, 0x02, 0x18, 0x01, 0x52, 0x0b, 0x6e, 0x65, 0x74, 0x77, 0x6f,
+-	0x72, 0x6b, 0x4c, 0x69, 0x73, 0x74, 0x12, 0x34, 0x0a, 0x08, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72,
+-	0x6b, 0x73, 0x18, 0x0d, 0x20, 0x03, 0x28, 0x0e, 0x32, 0x18, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e,
+-	0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x4e, 0x65, 0x74, 0x77, 0x6f,
+-	0x72, 0x6b, 0x52, 0x08, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x73, 0x12, 0x3a, 0x0a, 0x0b,
+-	0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x5f, 0x63, 0x69, 0x64, 0x72, 0x18, 0x06, 0x20, 0x03, 0x28,
+-	0x0b, 0x32, 0x15, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75,
+-	0x74, 0x65, 0x72, 0x2e, 0x43, 0x49, 0x44, 0x52, 0x42, 0x02, 0x18, 0x01, 0x52, 0x0a, 0x73, 0x6f,
+-	0x75, 0x72, 0x63, 0x65, 0x43, 0x69, 0x64, 0x72, 0x12, 0x39, 0x0a, 0x0c, 0x73, 0x6f, 0x75, 0x72,
+-	0x63, 0x65, 0x5f, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x18, 0x0b, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x16,
+-	0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72,
+-	0x2e, 0x47, 0x65, 0x6f, 0x49, 0x50, 0x52, 0x0b, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x47, 0x65,
+-	0x6f, 0x69, 0x70, 0x12, 0x43, 0x0a, 0x10, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x5f, 0x70, 0x6f,
+-	0x72, 0x74, 0x5f, 0x6c, 0x69, 0x73, 0x74, 0x18, 0x10, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x19, 0x2e,
++	0x79, 0x22, 0xb1, 0x06, 0x0a, 0x0b, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c,
++	0x65, 0x12, 0x23, 0x0a, 0x0c, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x5f, 0x74, 0x61,
++	0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x48, 0x00, 0x52, 0x0b, 0x6f, 0x75, 0x74, 0x62, 0x6f,
++	0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x12, 0x25, 0x0a, 0x0d, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63,
++	0x69, 0x6e, 0x67, 0x5f, 0x74, 0x61, 0x67, 0x18, 0x0c, 0x20, 0x01, 0x28, 0x09, 0x48, 0x00, 0x52,
++	0x0c, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x54, 0x61, 0x67, 0x12, 0x2f, 0x0a,
++	0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x18, 0x02, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x17, 0x2e,
++	0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e,
++	0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x52, 0x06, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x12, 0x2d,
++	0x0a, 0x04, 0x63, 0x69, 0x64, 0x72, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x15, 0x2e, 0x78,
++	0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x43,
++	0x49, 0x44, 0x52, 0x42, 0x02, 0x18, 0x01, 0x52, 0x04, 0x63, 0x69, 0x64, 0x72, 0x12, 0x2c, 0x0a,
++	0x05, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x18, 0x0a, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x16, 0x2e, 0x78,
++	0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x47,
++	0x65, 0x6f, 0x49, 0x50, 0x52, 0x05, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x12, 0x3d, 0x0a, 0x0a, 0x70,
++	0x6f, 0x72, 0x74, 0x5f, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0b, 0x32,
++	0x1a, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65,
++	0x74, 0x2e, 0x50, 0x6f, 0x72, 0x74, 0x52, 0x61, 0x6e, 0x67, 0x65, 0x42, 0x02, 0x18, 0x01, 0x52,
++	0x09, 0x70, 0x6f, 0x72, 0x74, 0x52, 0x61, 0x6e, 0x67, 0x65, 0x12, 0x36, 0x0a, 0x09, 0x70, 0x6f,
++	0x72, 0x74, 0x5f, 0x6c, 0x69, 0x73, 0x74, 0x18, 0x0e, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x19, 0x2e,
+ 	0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e,
+-	0x50, 0x6f, 0x72, 0x74, 0x4c, 0x69, 0x73, 0x74, 0x52, 0x0e, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65,
+-	0x50, 0x6f, 0x72, 0x74, 0x4c, 0x69, 0x73, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x75, 0x73, 0x65, 0x72,
+-	0x5f, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x18, 0x07, 0x20, 0x03, 0x28, 0x09, 0x52, 0x09, 0x75, 0x73,
+-	0x65, 0x72, 0x45, 0x6d, 0x61, 0x69, 0x6c, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e, 0x62, 0x6f, 0x75,
+-	0x6e, 0x64, 0x5f, 0x74, 0x61, 0x67, 0x18, 0x08, 0x20, 0x03, 0x28, 0x09, 0x52, 0x0a, 0x69, 0x6e,
+-	0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x12, 0x1a, 0x0a, 0x08, 0x70, 0x72, 0x6f, 0x74,
+-	0x6f, 0x63, 0x6f, 0x6c, 0x18, 0x09, 0x20, 0x03, 0x28, 0x09, 0x52, 0x08, 0x70, 0x72, 0x6f, 0x74,
+-	0x6f, 0x63, 0x6f, 0x6c, 0x12, 0x1e, 0x0a, 0x0a, 0x61, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74,
+-	0x65, 0x73, 0x18, 0x0f, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x61, 0x74, 0x74, 0x72, 0x69, 0x62,
+-	0x75, 0x74, 0x65, 0x73, 0x42, 0x0c, 0x0a, 0x0a, 0x74, 0x61, 0x72, 0x67, 0x65, 0x74, 0x5f, 0x74,
+-	0x61, 0x67, 0x22, 0x4e, 0x0a, 0x0d, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52,
+-	0x75, 0x6c, 0x65, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
+-	0x52, 0x03, 0x74, 0x61, 0x67, 0x12, 0x2b, 0x0a, 0x11, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e,
+-	0x64, 0x5f, 0x73, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x18, 0x02, 0x20, 0x03, 0x28, 0x09,
+-	0x52, 0x10, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x53, 0x65, 0x6c, 0x65, 0x63, 0x74,
+-	0x6f, 0x72, 0x22, 0x9b, 0x02, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x12, 0x4f, 0x0a,
+-	0x0f, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x5f, 0x73, 0x74, 0x72, 0x61, 0x74, 0x65, 0x67, 0x79,
+-	0x18, 0x01, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x26, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70,
+-	0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e,
+-	0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x53, 0x74, 0x72, 0x61, 0x74, 0x65, 0x67, 0x79, 0x52, 0x0e,
+-	0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x53, 0x74, 0x72, 0x61, 0x74, 0x65, 0x67, 0x79, 0x12, 0x30,
+-	0x0a, 0x04, 0x72, 0x75, 0x6c, 0x65, 0x18, 0x02, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1c, 0x2e, 0x78,
+-	0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x52,
+-	0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x04, 0x72, 0x75, 0x6c, 0x65,
+-	0x12, 0x45, 0x0a, 0x0e, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x5f, 0x72, 0x75,
+-	0x6c, 0x65, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e,
+-	0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x42, 0x61, 0x6c, 0x61, 0x6e,
+-	0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x0d, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63,
+-	0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x22, 0x47, 0x0a, 0x0e, 0x44, 0x6f, 0x6d, 0x61, 0x69,
+-	0x6e, 0x53, 0x74, 0x72, 0x61, 0x74, 0x65, 0x67, 0x79, 0x12, 0x08, 0x0a, 0x04, 0x41, 0x73, 0x49,
+-	0x73, 0x10, 0x00, 0x12, 0x09, 0x0a, 0x05, 0x55, 0x73, 0x65, 0x49, 0x70, 0x10, 0x01, 0x12, 0x10,
+-	0x0a, 0x0c, 0x49, 0x70, 0x49, 0x66, 0x4e, 0x6f, 0x6e, 0x4d, 0x61, 0x74, 0x63, 0x68, 0x10, 0x02,
+-	0x12, 0x0e, 0x0a, 0x0a, 0x49, 0x70, 0x4f, 0x6e, 0x44, 0x65, 0x6d, 0x61, 0x6e, 0x64, 0x10, 0x03,
+-	0x42, 0x4f, 0x0a, 0x13, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70,
+-	0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x50, 0x01, 0x5a, 0x24, 0x67, 0x69, 0x74, 0x68, 0x75,
+-	0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72, 0x61, 0x79, 0x2d,
+-	0x63, 0x6f, 0x72, 0x65, 0x2f, 0x61, 0x70, 0x70, 0x2f, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0xaa,
+-	0x02, 0x0f, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x41, 0x70, 0x70, 0x2e, 0x52, 0x6f, 0x75, 0x74, 0x65,
+-	0x72, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x50, 0x6f, 0x72, 0x74, 0x4c, 0x69, 0x73, 0x74, 0x52, 0x08, 0x70, 0x6f, 0x72, 0x74, 0x4c, 0x69,
++	0x73, 0x74, 0x12, 0x43, 0x0a, 0x0c, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x5f, 0x6c, 0x69,
++	0x73, 0x74, 0x18, 0x05, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1c, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e,
++	0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x4e, 0x65, 0x74, 0x77, 0x6f,
++	0x72, 0x6b, 0x4c, 0x69, 0x73, 0x74, 0x42, 0x02, 0x18, 0x01, 0x52, 0x0b, 0x6e, 0x65, 0x74, 0x77,
++	0x6f, 0x72, 0x6b, 0x4c, 0x69, 0x73, 0x74, 0x12, 0x34, 0x0a, 0x08, 0x6e, 0x65, 0x74, 0x77, 0x6f,
++	0x72, 0x6b, 0x73, 0x18, 0x0d, 0x20, 0x03, 0x28, 0x0e, 0x32, 0x18, 0x2e, 0x78, 0x72, 0x61, 0x79,
++	0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74, 0x2e, 0x4e, 0x65, 0x74, 0x77,
++	0x6f, 0x72, 0x6b, 0x52, 0x08, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x73, 0x12, 0x3a, 0x0a,
++	0x0b, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x5f, 0x63, 0x69, 0x64, 0x72, 0x18, 0x06, 0x20, 0x03,
++	0x28, 0x0b, 0x32, 0x15, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f,
++	0x75, 0x74, 0x65, 0x72, 0x2e, 0x43, 0x49, 0x44, 0x52, 0x42, 0x02, 0x18, 0x01, 0x52, 0x0a, 0x73,
++	0x6f, 0x75, 0x72, 0x63, 0x65, 0x43, 0x69, 0x64, 0x72, 0x12, 0x39, 0x0a, 0x0c, 0x73, 0x6f, 0x75,
++	0x72, 0x63, 0x65, 0x5f, 0x67, 0x65, 0x6f, 0x69, 0x70, 0x18, 0x0b, 0x20, 0x03, 0x28, 0x0b, 0x32,
++	0x16, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65,
++	0x72, 0x2e, 0x47, 0x65, 0x6f, 0x49, 0x50, 0x52, 0x0b, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x47,
++	0x65, 0x6f, 0x69, 0x70, 0x12, 0x43, 0x0a, 0x10, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0x5f, 0x70,
++	0x6f, 0x72, 0x74, 0x5f, 0x6c, 0x69, 0x73, 0x74, 0x18, 0x10, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x19,
++	0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x6e, 0x65, 0x74,
++	0x2e, 0x50, 0x6f, 0x72, 0x74, 0x4c, 0x69, 0x73, 0x74, 0x52, 0x0e, 0x73, 0x6f, 0x75, 0x72, 0x63,
++	0x65, 0x50, 0x6f, 0x72, 0x74, 0x4c, 0x69, 0x73, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x75, 0x73, 0x65,
++	0x72, 0x5f, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x18, 0x07, 0x20, 0x03, 0x28, 0x09, 0x52, 0x09, 0x75,
++	0x73, 0x65, 0x72, 0x45, 0x6d, 0x61, 0x69, 0x6c, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e, 0x62, 0x6f,
++	0x75, 0x6e, 0x64, 0x5f, 0x74, 0x61, 0x67, 0x18, 0x08, 0x20, 0x03, 0x28, 0x09, 0x52, 0x0a, 0x69,
++	0x6e, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x54, 0x61, 0x67, 0x12, 0x1a, 0x0a, 0x08, 0x70, 0x72, 0x6f,
++	0x74, 0x6f, 0x63, 0x6f, 0x6c, 0x18, 0x09, 0x20, 0x03, 0x28, 0x09, 0x52, 0x08, 0x70, 0x72, 0x6f,
++	0x74, 0x6f, 0x63, 0x6f, 0x6c, 0x12, 0x1e, 0x0a, 0x0a, 0x61, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75,
++	0x74, 0x65, 0x73, 0x18, 0x0f, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x61, 0x74, 0x74, 0x72, 0x69,
++	0x62, 0x75, 0x74, 0x65, 0x73, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x11, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x03, 0x74, 0x61, 0x67, 0x42, 0x0c, 0x0a, 0x0a, 0x74, 0x61, 0x72, 0x67, 0x65,
++	0x74, 0x5f, 0x74, 0x61, 0x67, 0x22, 0x4e, 0x0a, 0x0d, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69,
++	0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x12, 0x10, 0x0a, 0x03, 0x74, 0x61, 0x67, 0x18, 0x01, 0x20,
++	0x01, 0x28, 0x09, 0x52, 0x03, 0x74, 0x61, 0x67, 0x12, 0x2b, 0x0a, 0x11, 0x6f, 0x75, 0x74, 0x62,
++	0x6f, 0x75, 0x6e, 0x64, 0x5f, 0x73, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x18, 0x02, 0x20,
++	0x03, 0x28, 0x09, 0x52, 0x10, 0x6f, 0x75, 0x74, 0x62, 0x6f, 0x75, 0x6e, 0x64, 0x53, 0x65, 0x6c,
++	0x65, 0x63, 0x74, 0x6f, 0x72, 0x22, 0x9b, 0x02, 0x0a, 0x06, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67,
++	0x12, 0x4f, 0x0a, 0x0f, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x5f, 0x73, 0x74, 0x72, 0x61, 0x74,
++	0x65, 0x67, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x26, 0x2e, 0x78, 0x72, 0x61, 0x79,
++	0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x43, 0x6f, 0x6e, 0x66,
++	0x69, 0x67, 0x2e, 0x44, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x53, 0x74, 0x72, 0x61, 0x74, 0x65, 0x67,
++	0x79, 0x52, 0x0e, 0x64, 0x6f, 0x6d, 0x61, 0x69, 0x6e, 0x53, 0x74, 0x72, 0x61, 0x74, 0x65, 0x67,
++	0x79, 0x12, 0x30, 0x0a, 0x04, 0x72, 0x75, 0x6c, 0x65, 0x18, 0x02, 0x20, 0x03, 0x28, 0x0b, 0x32,
++	0x1c, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65,
++	0x72, 0x2e, 0x52, 0x6f, 0x75, 0x74, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x04, 0x72,
++	0x75, 0x6c, 0x65, 0x12, 0x45, 0x0a, 0x0e, 0x62, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67,
++	0x5f, 0x72, 0x75, 0x6c, 0x65, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1e, 0x2e, 0x78, 0x72,
++	0x61, 0x79, 0x2e, 0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x2e, 0x42, 0x61,
++	0x6c, 0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x52, 0x0d, 0x62, 0x61, 0x6c,
++	0x61, 0x6e, 0x63, 0x69, 0x6e, 0x67, 0x52, 0x75, 0x6c, 0x65, 0x22, 0x47, 0x0a, 0x0e, 0x44, 0x6f,
++	0x6d, 0x61, 0x69, 0x6e, 0x53, 0x74, 0x72, 0x61, 0x74, 0x65, 0x67, 0x79, 0x12, 0x08, 0x0a, 0x04,
++	0x41, 0x73, 0x49, 0x73, 0x10, 0x00, 0x12, 0x09, 0x0a, 0x05, 0x55, 0x73, 0x65, 0x49, 0x70, 0x10,
++	0x01, 0x12, 0x10, 0x0a, 0x0c, 0x49, 0x70, 0x49, 0x66, 0x4e, 0x6f, 0x6e, 0x4d, 0x61, 0x74, 0x63,
++	0x68, 0x10, 0x02, 0x12, 0x0e, 0x0a, 0x0a, 0x49, 0x70, 0x4f, 0x6e, 0x44, 0x65, 0x6d, 0x61, 0x6e,
++	0x64, 0x10, 0x03, 0x42, 0x4f, 0x0a, 0x13, 0x63, 0x6f, 0x6d, 0x2e, 0x78, 0x72, 0x61, 0x79, 0x2e,
++	0x61, 0x70, 0x70, 0x2e, 0x72, 0x6f, 0x75, 0x74, 0x65, 0x72, 0x50, 0x01, 0x5a, 0x24, 0x67, 0x69,
++	0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x78, 0x74, 0x6c, 0x73, 0x2f, 0x78, 0x72,
++	0x61, 0x79, 0x2d, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x61, 0x70, 0x70, 0x2f, 0x72, 0x6f, 0x75, 0x74,
++	0x65, 0x72, 0xaa, 0x02, 0x0f, 0x58, 0x72, 0x61, 0x79, 0x2e, 0x41, 0x70, 0x70, 0x2e, 0x52, 0x6f,
++	0x75, 0x74, 0x65, 0x72, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+ }
+ 
+ var (
+@@ -1213,7 +1218,7 @@ func file_app_router_config_proto_init() {
+ 		}
+ 	}
+ 	file_app_router_config_proto_msgTypes[6].OneofWrappers = []interface{}{
+-		(*RoutingRule_Tag)(nil),
++		(*RoutingRule_OutboundTag)(nil),
+ 		(*RoutingRule_BalancingTag)(nil),
+ 	}
+ 	file_app_router_config_proto_msgTypes[9].OneofWrappers = []interface{}{
+diff --git a/app/router/config.proto b/app/router/config.proto
+index c5e655a..47f6918 100644
+--- a/app/router/config.proto
++++ b/app/router/config.proto
+@@ -72,7 +72,7 @@ message GeoSiteList {
+ message RoutingRule {
+   oneof target_tag {
+     // Tag of outbound that this rule is pointing to.
+-    string tag = 1;
++    string outbound_tag = 1;
+ 
+     // Tag of routing balancer.
+     string balancing_tag = 12;
+@@ -119,6 +119,7 @@ message RoutingRule {
+   repeated string protocol = 9;
+ 
+   string attributes = 15;
++  string tag = 17;
+ }
+ 
+ message BalancingRule {
+diff --git a/app/router/router.go b/app/router/router.go
+index 5d2bdc3..aaf42f8 100644
+--- a/app/router/router.go
++++ b/app/router/router.go
+@@ -4,21 +4,25 @@ package router
+ 
+ import (
+ 	"context"
+-
+ 	"github.com/xtls/xray-core/common"
++	"github.com/xtls/xray-core/common/session"
++	"github.com/xtls/xray-core/common/uuid"
+ 	"github.com/xtls/xray-core/core"
+ 	"github.com/xtls/xray-core/features/dns"
+ 	"github.com/xtls/xray-core/features/outbound"
+ 	"github.com/xtls/xray-core/features/routing"
+ 	routing_dns "github.com/xtls/xray-core/features/routing/dns"
++	"sync"
+ )
+ 
+ // Router is an implementation of routing.Router.
+ type Router struct {
++	access         sync.RWMutex
+ 	domainStrategy Config_DomainStrategy
+-	rules          []*Rule
++	rules          map[string]*Rule
+ 	balancers      map[string]*Balancer
+ 	dns            dns.Client
++	Tag            string
+ }
+ 
+ // Route is an implementation of routing.Route.
+@@ -33,7 +37,9 @@ func (r *Router) Init(config *Config, d dns.Client, ohm outbound.Manager) error
+ 	r.domainStrategy = config.DomainStrategy
+ 	r.dns = d
+ 
+-	r.balancers = make(map[string]*Balancer, len(config.BalancingRule))
++	r.access.Lock()
++	defer r.access.Unlock()
++	r.balancers = make(map[string]*Balancer)
+ 	for _, rule := range config.BalancingRule {
+ 		balancer, err := rule.Build(ohm)
+ 		if err != nil {
+@@ -42,7 +48,7 @@ func (r *Router) Init(config *Config, d dns.Client, ohm outbound.Manager) error
+ 		r.balancers[rule.Tag] = balancer
+ 	}
+ 
+-	r.rules = make([]*Rule, 0, len(config.Rule))
++	r.rules = make(map[string]*Rule)
+ 	for _, rule := range config.Rule {
+ 		cond, err := rule.BuildCondition()
+ 		if err != nil {
+@@ -59,8 +65,17 @@ func (r *Router) Init(config *Config, d dns.Client, ohm outbound.Manager) error
+ 				return newError("balancer ", btag, " not found")
+ 			}
+ 			rr.Balancer = brule
++			rr.TargetTag = btag
++		} else {
++			rr.TargetTag = rule.GetTargetTag().(*RoutingRule_OutboundTag).OutboundTag
++		}
++
++		if len(rr.Tag) == 0 {
++			u := uuid.New()
++			rr.Tag = u.String()
+ 		}
+-		r.rules = append(r.rules, rr)
++
++		r.rules[rr.Tag] = rr
+ 	}
+ 
+ 	return nil
+@@ -72,7 +87,7 @@ func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	tag, err := rule.GetTag()
++	tag, err := rule.GetTargetTag()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -84,6 +99,9 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
+ 		ctx = routing_dns.ContextWithDNSClient(ctx, r.dns)
+ 	}
+ 
++	r.access.RLock()
++	defer r.access.RUnlock()
++
+ 	for _, rule := range r.rules {
+ 		if rule.Apply(ctx) {
+ 			return rule, ctx, nil
+@@ -106,6 +124,103 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
+ 	return nil, ctx, common.ErrNoClue
+ }
+ 
++// AddRoutingRule implement the manager interface.
++func (r *Router) AddRoutingRule(ctx context.Context, routingRule interface{}) error {
++	rr := routingRule.(*RoutingRule)
++	rule, err := rr.Build(r)
++	if err != nil {
++		return err
++	}
++	r.access.Lock()
++	defer r.access.Unlock()
++
++	r.rules[rule.Tag] = rule
++	newError("Rule has been added through the API. [", rule.Tag, "]").WriteToLog(session.ExportIDToError(ctx))
++	return nil
++}
++
++// AlterRoutingRule implement the manager interface.
++func (r *Router) AlterRoutingRule(ctx context.Context, tag string, routingRule interface{}) error {
++	if _, found := r.rules[tag]; !found {
++		return newError("tag not found: " + tag)
++	}
++
++	rr := routingRule.(*RoutingRule)
++	// Removing the tag ensures that Build works properly
++	rr.Tag = ""
++	rule, err := rr.Build(r)
++	if err != nil {
++		return err
++	}
++	r.access.Lock()
++	defer r.access.Unlock()
++
++	rule.Tag = tag
++	r.rules[tag] = rule
++	newError("The rules have been modified through the API. [", rule.Tag, "]").WriteToLog(session.ExportIDToError(ctx))
++	return nil
++}
++
++// RemoveRoutingRule implement the manager interface.
++func (r *Router) RemoveRoutingRule(ctx context.Context, tag string) error {
++	if _, found := r.rules[tag]; !found {
++		return newError("tag not found: " + tag)
++	}
++	r.access.Lock()
++	defer r.access.Unlock()
++
++	delete(r.rules, tag)
++	newError("The rule has been removed through the API. [", tag, "]").WriteToLog(session.ExportIDToError(ctx))
++	return nil
++}
++
++// AddBalancingRule implement the manager interface.
++func (r *Router) AddBalancingRule(ctx context.Context, balancingRule interface{}, om outbound.Manager) error {
++	br := balancingRule.(*BalancingRule)
++	balancer, err := br.Build(om)
++	if err != nil {
++		return err
++	}
++	r.access.Lock()
++	defer r.access.Unlock()
++
++	r.balancers[br.Tag] = balancer
++	newError("Rule has been added through the API. [", br.Tag, "]").WriteToLog(session.ExportIDToError(ctx))
++	return nil
++}
++
++// AlterBalancingRule implement the manager interface.
++func (r *Router) AlterBalancingRule(ctx context.Context, tag string, balancingRule interface{}, om outbound.Manager) error {
++	if _, found := r.balancers[tag]; !found {
++		return newError("tag not found: " + tag)
++	}
++
++	br := balancingRule.(*BalancingRule)
++	balancer, err := br.Build(om)
++	if err != nil {
++		return err
++	}
++	r.access.Lock()
++	defer r.access.Unlock()
++
++	r.balancers[tag] = balancer
++	newError("The rules have been modified through the API. [", tag, "]").WriteToLog(session.ExportIDToError(ctx))
++	return nil
++}
++
++// RemoveBalancingRule implement the manager interface.
++func (r *Router) RemoveBalancingRule(ctx context.Context, tag string) error {
++	if _, found := r.balancers[tag]; !found {
++		return newError("tag not found: " + tag)
++	}
++	r.access.Lock()
++	defer r.access.Unlock()
++
++	delete(r.balancers, tag)
++	newError("The rule has been removed through the API. [", tag, "]").WriteToLog(session.ExportIDToError(ctx))
++	return nil
++}
++
+ // Start implements common.Runnable.
+ func (*Router) Start() error {
+ 	return nil
+diff --git a/app/router/router_test.go b/app/router/router_test.go
+index 14ce8a3..468a311 100644
+--- a/app/router/router_test.go
++++ b/app/router/router_test.go
+@@ -2,6 +2,7 @@ package router_test
+ 
+ import (
+ 	"context"
++	"github.com/xtls/xray-core/core"
+ 	"testing"
+ 
+ 	"github.com/golang/mock/gomock"
+@@ -24,8 +25,8 @@ func TestSimpleRouter(t *testing.T) {
+ 	config := &Config{
+ 		Rule: []*RoutingRule{
+ 			{
+-				TargetTag: &RoutingRule_Tag{
+-					Tag: "test",
++				TargetTag: &RoutingRule_OutboundTag{
++					OutboundTag: "test",
+ 				},
+ 				Networks: []net.Network{net.Network_TCP},
+ 			},
+@@ -99,8 +100,8 @@ func TestIPOnDemand(t *testing.T) {
+ 		DomainStrategy: Config_IpOnDemand,
+ 		Rule: []*RoutingRule{
+ 			{
+-				TargetTag: &RoutingRule_Tag{
+-					Tag: "test",
++				TargetTag: &RoutingRule_OutboundTag{
++					OutboundTag: "test",
+ 				},
+ 				Cidr: []*CIDR{
+ 					{
+@@ -138,8 +139,8 @@ func TestIPIfNonMatchDomain(t *testing.T) {
+ 		DomainStrategy: Config_IpIfNonMatch,
+ 		Rule: []*RoutingRule{
+ 			{
+-				TargetTag: &RoutingRule_Tag{
+-					Tag: "test",
++				TargetTag: &RoutingRule_OutboundTag{
++					OutboundTag: "test",
+ 				},
+ 				Cidr: []*CIDR{
+ 					{
+@@ -177,8 +178,8 @@ func TestIPIfNonMatchIP(t *testing.T) {
+ 		DomainStrategy: Config_IpIfNonMatch,
+ 		Rule: []*RoutingRule{
+ 			{
+-				TargetTag: &RoutingRule_Tag{
+-					Tag: "test",
++				TargetTag: &RoutingRule_OutboundTag{
++					OutboundTag: "test",
+ 				},
+ 				Cidr: []*CIDR{
+ 					{
+@@ -205,3 +206,135 @@ func TestIPIfNonMatchIP(t *testing.T) {
+ 		t.Error("expect tag 'test', bug actually ", tag)
+ 	}
+ }
++
++func TestRouter_AddRoutingRule(t *testing.T) {
++	config := &Config{}
++
++	mockCtl := gomock.NewController(t)
++	defer mockCtl.Finish()
++
++	mockDNS := mocks.NewDNSClient(mockCtl)
++	mockOhm := mocks.NewOutboundManager(mockCtl)
++	mockHs := mocks.NewOutboundHandlerSelector(mockCtl)
++
++	r := new(Router)
++	common.Must(r.Init(config, mockDNS, &mockOutboundManager{
++		Manager:         mockOhm,
++		HandlerSelector: mockHs,
++	}))
++
++	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)})
++	err := r.AddRoutingRule(ctx, &RoutingRule{
++		TargetTag: &RoutingRule_OutboundTag{
++			OutboundTag: "test",
++		},
++		Domain: []*Domain{
++			{
++				Type:  Domain_Domain,
++				Value: "example.com",
++			},
++		},
++	})
++	common.Must(err)
++
++	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
++	common.Must(err)
++	if tag := route.GetOutboundTag(); tag != "test" {
++		t.Error("expect tag 'test', bug actually ", tag)
++	}
++}
++
++func TestRouter_AlterRoutingRule(t *testing.T) {
++	config := &Config{
++		Rule: []*RoutingRule{
++			{
++				TargetTag: &RoutingRule_OutboundTag{
++					OutboundTag: "example",
++				},
++				Networks: []net.Network{net.Network_TCP},
++				Tag:      "test",
++			},
++		},
++	}
++
++	mockCtl := gomock.NewController(t)
++	defer mockCtl.Finish()
++
++	mockDNS := mocks.NewDNSClient(mockCtl)
++	mockOhm := mocks.NewOutboundManager(mockCtl)
++	mockHs := mocks.NewOutboundHandlerSelector(mockCtl)
++
++	r := new(Router)
++	common.Must(r.Init(config, mockDNS, &mockOutboundManager{
++		Manager:         mockOhm,
++		HandlerSelector: mockHs,
++	}))
++
++	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)})
++	err := r.AlterRoutingRule(ctx, "test", &RoutingRule{
++		TargetTag: &RoutingRule_OutboundTag{
++			OutboundTag: "test",
++		},
++		Domain: []*Domain{
++			{
++				Type:  Domain_Domain,
++				Value: "example.com",
++			},
++		},
++		Tag: "test",
++	})
++	common.Must(err)
++	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
++	common.Must(err)
++	if tag := route.GetOutboundTag(); tag != "test" {
++		t.Error("expect tag 'test', bug actually ", tag)
++	}
++}
++
++func TestRouter_RemoveRoutingRule(t *testing.T) {
++	config := &Config{
++		Rule: []*RoutingRule{
++			{
++				TargetTag: &RoutingRule_OutboundTag{
++					OutboundTag: "example",
++				},
++				Domain: []*Domain{
++					{
++						Type:  Domain_Domain,
++						Value: "example.com",
++					},
++				},
++				Tag: "example",
++			},
++			{
++				TargetTag: &RoutingRule_OutboundTag{
++					OutboundTag: "test",
++				},
++				Networks: []net.Network{net.Network_TCP},
++				Tag:      "test",
++			},
++		},
++	}
++
++	mockCtl := gomock.NewController(t)
++	defer mockCtl.Finish()
++
++	mockDNS := mocks.NewDNSClient(mockCtl)
++	mockOhm := mocks.NewOutboundManager(mockCtl)
++	mockHs := mocks.NewOutboundHandlerSelector(mockCtl)
++
++	r := new(Router)
++	common.Must(r.Init(config, mockDNS, &mockOutboundManager{
++		Manager:         mockOhm,
++		HandlerSelector: mockHs,
++	}))
++
++	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)})
++	err := r.RemoveRoutingRule(ctx, "example")
++	common.Must(err)
++	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
++	common.Must(err)
++	if tag := route.GetOutboundTag(); tag != "test" {
++		t.Error("expect tag 'test', bug actually ", tag)
++	}
++}
+diff --git a/features/routing/context.go b/features/routing/context.go
+index f5a732a..d2d19f1 100644
+--- a/features/routing/context.go
++++ b/features/routing/context.go
+@@ -37,4 +37,7 @@ type Context interface {
+ 
+ 	// GetAttributes returns extra attributes from the conneciont content.
+ 	GetAttributes() map[string]string
++
++	// GetUser returns the user email from the connection content, if exists.
++	GetTag() string
+ }
+diff --git a/features/routing/router.go b/features/routing/router.go
+index 3d6f150..dd23915 100644
+--- a/features/routing/router.go
++++ b/features/routing/router.go
+@@ -1,8 +1,10 @@
+ package routing
+ 
+ import (
++	"context"
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/features"
++	"github.com/xtls/xray-core/features/outbound"
+ )
+ 
+ // Router is a feature to choose an outbound tag for the given request.
+@@ -10,6 +12,7 @@ import (
+ // xray:api:stable
+ type Router interface {
+ 	features.Feature
++	Manager
+ 
+ 	// PickRoute returns a route decision based on the given routing context.
+ 	PickRoute(ctx Context) (Route, error)
+@@ -49,6 +52,36 @@ func (DefaultRouter) PickRoute(ctx Context) (Route, error) {
+ 	return nil, common.ErrNoClue
+ }
+ 
++// AddRoutingRule implements Router.
++func (DefaultRouter) AddRoutingRule(ctx context.Context, routingRule interface{}) error {
++	return common.ErrNoClue
++}
++
++// AlterRoutingRule implements Router.
++func (DefaultRouter) AlterRoutingRule(ctx context.Context, tag string, routingRule interface{}) error {
++	return common.ErrNoClue
++}
++
++// RemoveRoutingRule implements Router.
++func (DefaultRouter) RemoveRoutingRule(ctx context.Context, tag string) error {
++	return common.ErrNoClue
++}
++
++// AddBalancingRule implements Router.
++func (DefaultRouter) AddBalancingRule(ctx context.Context, balancingRule interface{}, handler outbound.Manager) error {
++	return common.ErrNoClue
++}
++
++// AlterBalancingRule implements Router.
++func (DefaultRouter) AlterBalancingRule(ctx context.Context, tag string, balancingRule interface{}, handler outbound.Manager) error {
++	return common.ErrNoClue
++}
++
++// RemoveBalancingRule implements Router.
++func (DefaultRouter) RemoveBalancingRule(ctx context.Context, tag string) error {
++	return common.ErrNoClue
++}
++
+ // Start implements common.Runnable.
+ func (DefaultRouter) Start() error {
+ 	return nil
+@@ -58,3 +91,22 @@ func (DefaultRouter) Start() error {
+ func (DefaultRouter) Close() error {
+ 	return nil
+ }
++
++// Manager is a feature that manages Router rule.
++//
++// xray:api:alpha
++type Manager interface {
++	features.Feature
++	// AddRoutingRule adds the given routing rule into this Manager.
++	AddRoutingRule(ctx context.Context, routingRule interface{}) error
++	// AlterRoutingRule Modifies the specified routing rule
++	AlterRoutingRule(ctx context.Context, tag string, routingRule interface{}) error
++	// RemoveRoutingRule Remove the specified routing rule
++	RemoveRoutingRule(ctx context.Context, tag string) error
++	// AddBalancingRule adds the given balancing rules to this manager.
++	AddBalancingRule(ctx context.Context, balancingRule interface{}, handler outbound.Manager) error
++	// AlterBalancingRule Modifies the specified balancing rule
++	AlterBalancingRule(ctx context.Context, tag string, balancingRule interface{}, handler outbound.Manager) error
++	// RemoveBalancingRule Remove the specified balancing rule
++	RemoveBalancingRule(ctx context.Context, tag string) error
++}
+diff --git a/features/routing/session/context.go b/features/routing/session/context.go
+index 0b37ebf..fba1aa5 100644
+--- a/features/routing/session/context.go
++++ b/features/routing/session/context.go
+@@ -15,6 +15,10 @@ type Context struct {
+ 	Content  *session.Content
+ }
+ 
++func (ctx *Context) GetTag() string {
++	return ""
++}
++
+ // GetInboundTag implements routing.Context.
+ func (ctx *Context) GetInboundTag() string {
+ 	if ctx.Inbound == nil {
+diff --git a/infra/conf/api.go b/infra/conf/api.go
+index 02bc77d..0ee0b08 100644
+--- a/infra/conf/api.go
++++ b/infra/conf/api.go
+@@ -6,6 +6,7 @@ import (
+ 	"github.com/xtls/xray-core/app/commander"
+ 	loggerservice "github.com/xtls/xray-core/app/log/command"
+ 	handlerservice "github.com/xtls/xray-core/app/proxyman/command"
++	routingservice "github.com/xtls/xray-core/app/router/command"
+ 	statsservice "github.com/xtls/xray-core/app/stats/command"
+ 	"github.com/xtls/xray-core/common/serial"
+ )
+@@ -27,6 +28,8 @@ func (c *APIConfig) Build() (*commander.Config, error) {
+ 			services = append(services, serial.ToTypedMessage(&commander.ReflectionConfig{}))
+ 		case "handlerservice":
+ 			services = append(services, serial.ToTypedMessage(&handlerservice.Config{}))
++		case "routingservice":
++			services = append(services, serial.ToTypedMessage(&routingservice.Config{}))
+ 		case "loggerservice":
+ 			services = append(services, serial.ToTypedMessage(&loggerservice.Config{}))
+ 		case "statsservice":
+diff --git a/infra/conf/router.go b/infra/conf/router.go
+index a93da6b..0d5c8e2 100644
+--- a/infra/conf/router.go
++++ b/infra/conf/router.go
+@@ -470,6 +470,7 @@ func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
+ 		InboundTag *StringList  `json:"inboundTag"`
+ 		Protocols  *StringList  `json:"protocol"`
+ 		Attributes string       `json:"attrs"`
++		Tag        string       `json:"tag"`
+ 	}
+ 	rawFieldRule := new(RawFieldRule)
+ 	err := json.Unmarshal(msg, rawFieldRule)
+@@ -480,8 +481,8 @@ func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
+ 	rule := new(router.RoutingRule)
+ 	switch {
+ 	case len(rawFieldRule.OutboundTag) > 0:
+-		rule.TargetTag = &router.RoutingRule_Tag{
+-			Tag: rawFieldRule.OutboundTag,
++		rule.TargetTag = &router.RoutingRule_OutboundTag{
++			OutboundTag: rawFieldRule.OutboundTag,
+ 		}
+ 	case len(rawFieldRule.BalancerTag) > 0:
+ 		rule.TargetTag = &router.RoutingRule_BalancingTag{
+@@ -561,6 +562,10 @@ func parseFieldRule(msg json.RawMessage) (*router.RoutingRule, error) {
+ 		rule.Attributes = rawFieldRule.Attributes
+ 	}
+ 
++	if len(rawFieldRule.Tag) > 0 {
++		rule.Tag = rawFieldRule.Tag
++	}
++
+ 	return rule, nil
+ }
+ 
+@@ -605,8 +610,8 @@ func parseChinaIPRule(data []byte) (*router.RoutingRule, error) {
+ 		return nil, newError("failed to load geoip:cn").Base(err)
+ 	}
+ 	return &router.RoutingRule{
+-		TargetTag: &router.RoutingRule_Tag{
+-			Tag: rawRule.OutboundTag,
++		TargetTag: &router.RoutingRule_OutboundTag{
++			OutboundTag: rawRule.OutboundTag,
+ 		},
+ 		Cidr: chinaIPs,
+ 	}, nil
+@@ -623,8 +628,8 @@ func parseChinaSitesRule(data []byte) (*router.RoutingRule, error) {
+ 		return nil, newError("failed to load geosite:cn.").Base(err)
+ 	}
+ 	return &router.RoutingRule{
+-		TargetTag: &router.RoutingRule_Tag{
+-			Tag: rawRule.OutboundTag,
++		TargetTag: &router.RoutingRule_OutboundTag{
++			OutboundTag: rawRule.OutboundTag,
+ 		},
+ 		Domain: domains,
+ 	}, nil
+diff --git a/infra/conf/router_test.go b/infra/conf/router_test.go
+index bb4fdc7..6b9b2c3 100644
+--- a/infra/conf/router_test.go
++++ b/infra/conf/router_test.go
+@@ -83,8 +83,8 @@ func TestRouterConfig(t *testing.T) {
+ 								Value: "qq.com",
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "direct",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "direct",
+ 						},
+ 					},
+ 					{
+@@ -102,8 +102,8 @@ func TestRouterConfig(t *testing.T) {
+ 								},
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "test",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "test",
+ 						},
+ 					},
+ 					{
+@@ -114,8 +114,8 @@ func TestRouterConfig(t *testing.T) {
+ 								{From: 1000, To: 2000},
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "test",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "test",
+ 						},
+ 					},
+ 					{
+@@ -124,8 +124,8 @@ func TestRouterConfig(t *testing.T) {
+ 								{From: 123, To: 123},
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "test",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "test",
+ 						},
+ 					},
+ 				},
+@@ -171,8 +171,8 @@ func TestRouterConfig(t *testing.T) {
+ 								Value: "qq.com",
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "direct",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "direct",
+ 						},
+ 					},
+ 					{
+@@ -190,8 +190,8 @@ func TestRouterConfig(t *testing.T) {
+ 								},
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "test",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "test",
+ 						},
+ 					},
+ 				},
+@@ -234,8 +234,8 @@ func TestRouterConfig(t *testing.T) {
+ 								Value: "qq.com",
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "direct",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "direct",
+ 						},
+ 					},
+ 					{
+@@ -253,8 +253,8 @@ func TestRouterConfig(t *testing.T) {
+ 								},
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "test",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "test",
+ 						},
+ 					},
+ 				},
+diff --git a/infra/conf/xray_test.go b/infra/conf/xray_test.go
+index d4f0ba6..acaef65 100644
+--- a/infra/conf/xray_test.go
++++ b/infra/conf/xray_test.go
+@@ -164,8 +164,8 @@ func TestXrayConfig(t *testing.T) {
+ 										},
+ 									},
+ 								},
+-								TargetTag: &router.RoutingRule_Tag{
+-									Tag: "blocked",
++								TargetTag: &router.RoutingRule_OutboundTag{
++									OutboundTag: "blocked",
+ 								},
+ 							},
+ 						},
+diff --git a/testing/scenarios/command_test.go b/testing/scenarios/command_test.go
+index 7e5f1ef..7e21bab 100644
+--- a/testing/scenarios/command_test.go
++++ b/testing/scenarios/command_test.go
+@@ -55,8 +55,8 @@ func TestCommanderRemoveHandler(t *testing.T) {
+ 				Rule: []*router.RoutingRule{
+ 					{
+ 						InboundTag: []string{"api"},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "api",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "api",
+ 						},
+ 					},
+ 				},
+@@ -153,8 +153,8 @@ func TestCommanderAddRemoveUser(t *testing.T) {
+ 				Rule: []*router.RoutingRule{
+ 					{
+ 						InboundTag: []string{"api"},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "api",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "api",
+ 						},
+ 					},
+ 				},
+@@ -335,8 +335,8 @@ func TestCommanderStats(t *testing.T) {
+ 				Rule: []*router.RoutingRule{
+ 					{
+ 						InboundTag: []string{"api"},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "api",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "api",
+ 						},
+ 					},
+ 				},
+diff --git a/testing/scenarios/dns_test.go b/testing/scenarios/dns_test.go
+index 886068d..2357911 100644
+--- a/testing/scenarios/dns_test.go
++++ b/testing/scenarios/dns_test.go
+@@ -45,8 +45,8 @@ func TestResolveIP(t *testing.T) {
+ 								Prefix: 8,
+ 							},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "direct",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "direct",
+ 						},
+ 					},
+ 				},
+diff --git a/testing/scenarios/feature_test.go b/testing/scenarios/feature_test.go
+index 3977606..3c4d758 100644
+--- a/testing/scenarios/feature_test.go
++++ b/testing/scenarios/feature_test.go
+@@ -427,8 +427,8 @@ func TestBlackhole(t *testing.T) {
+ 			serial.ToTypedMessage(&router.Config{
+ 				Rule: []*router.RoutingRule{
+ 					{
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "blocked",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "blocked",
+ 						},
+ 						PortRange: net.SinglePortRange(dest2.Port),
+ 					},
+@@ -602,13 +602,13 @@ func TestDomainSniffing(t *testing.T) {
+ 			serial.ToTypedMessage(&router.Config{
+ 				Rule: []*router.RoutingRule{
+ 					{
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "direct",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "direct",
+ 						},
+ 						InboundTag: []string{"snif"},
+ 					}, {
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "redir",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "redir",
+ 						},
+ 						InboundTag: []string{"http"},
+ 					},
+diff --git a/testing/scenarios/reverse_test.go b/testing/scenarios/reverse_test.go
+index cbe9abd..ac824fd 100644
+--- a/testing/scenarios/reverse_test.go
++++ b/testing/scenarios/reverse_test.go
+@@ -56,14 +56,14 @@ func TestReverseProxy(t *testing.T) {
+ 						Domain: []*router.Domain{
+ 							{Type: router.Domain_Full, Value: "test.example.com"},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "portal",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "portal",
+ 						},
+ 					},
+ 					{
+ 						InboundTag: []string{"external"},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "portal",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "portal",
+ 						},
+ 					},
+ 				},
+@@ -125,14 +125,14 @@ func TestReverseProxy(t *testing.T) {
+ 						Domain: []*router.Domain{
+ 							{Type: router.Domain_Full, Value: "test.example.com"},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "reverse",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "reverse",
+ 						},
+ 					},
+ 					{
+ 						InboundTag: []string{"bridge"},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "freedom",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "freedom",
+ 						},
+ 					},
+ 				},
+@@ -241,14 +241,14 @@ func TestReverseProxyLongRunning(t *testing.T) {
+ 						Domain: []*router.Domain{
+ 							{Type: router.Domain_Full, Value: "test.example.com"},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "portal",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "portal",
+ 						},
+ 					},
+ 					{
+ 						InboundTag: []string{"external"},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "portal",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "portal",
+ 						},
+ 					},
+ 				},
+@@ -324,14 +324,14 @@ func TestReverseProxyLongRunning(t *testing.T) {
+ 						Domain: []*router.Domain{
+ 							{Type: router.Domain_Full, Value: "test.example.com"},
+ 						},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "reverse",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "reverse",
+ 						},
+ 					},
+ 					{
+ 						InboundTag: []string{"bridge"},
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "freedom",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "freedom",
+ 						},
+ 					},
+ 				},
+diff --git a/testing/scenarios/socks_test.go b/testing/scenarios/socks_test.go
+index 72da1d8..e41ffad 100644
+--- a/testing/scenarios/socks_test.go
++++ b/testing/scenarios/socks_test.go
+@@ -198,8 +198,8 @@ func TestSocksBridageUDPWithRouting(t *testing.T) {
+ 			serial.ToTypedMessage(&router.Config{
+ 				Rule: []*router.RoutingRule{
+ 					{
+-						TargetTag: &router.RoutingRule_Tag{
+-							Tag: "out",
++						TargetTag: &router.RoutingRule_OutboundTag{
++							OutboundTag: "out",
+ 						},
+ 						InboundTag: []string{"socks"},
+ 					},
+-- 
+2.20.1
+

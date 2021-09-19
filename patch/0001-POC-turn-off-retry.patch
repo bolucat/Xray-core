@@ -1,0 +1,27 @@
+From 6a9cbe4bd7d00e631f16904b56eddf92f58fa432 Mon Sep 17 00:00:00 2001
+From: yuhan6665 <1588741+yuhan6665@users.noreply.github.com>
+Date: Thu, 22 Apr 2021 21:52:28 -0400
+Subject: [PATCH] POC turn off retry
+
+---
+ common/retry/retry.go | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/common/retry/retry.go b/common/retry/retry.go
+index 594e10e..ae58096 100644
+--- a/common/retry/retry.go
++++ b/common/retry/retry.go
+@@ -24,8 +24,8 @@ type retryer struct {
+ // On implements Strategy.On.
+ func (r *retryer) On(method func() error) error {
+ 	attempt := 0
+-	accumulatedError := make([]error, 0, r.totalAttempt)
+-	for attempt < r.totalAttempt {
++	accumulatedError := make([]error, 0, 1)
++	for attempt < 1 {
+ 		err := method()
+ 		if err == nil {
+ 			return nil
+-- 
+2.20.1
+
